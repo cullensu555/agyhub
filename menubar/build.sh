@@ -37,8 +37,15 @@ if [ ! -d "$SPARKLE" ]; then
 fi
 
 echo "==> 构建 Rust 内核"
-# 版本号编进内核：status / doctor / 日志里显示的版本与 App 一致
-(cd "$CORE" && AGYHUB_VERSION="$VERSION" cargo build --release)
+# 版本号编进内核：status / doctor / 日志里显示的版本与 App 一致。
+#
+# --remap-path-prefix：把编译机的本地路径从二进制里抹掉。
+# Rust 会把依赖库源码的绝对路径（panic 位置信息）编进产物，
+# 不处理的话每个发布的内核里都有约 250 处 /Users/<用户名>/.cargo/... ——
+# 等于把维护者的用户名发给了所有下载的人。
+CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
+REMAP="--remap-path-prefix=$CARGO_HOME_DIR=/cargo --remap-path-prefix=$HOME/.rustup=/rustup --remap-path-prefix=$CORE=/agyhub-rs"
+(cd "$CORE" && RUSTFLAGS="${RUSTFLAGS:-} $REMAP" AGYHUB_VERSION="$VERSION" cargo build --release)
 if [ "$("$CORE/target/release/agyhub" --version)" != "agyhub $VERSION" ]; then
   echo "✗ 内核版本号不对：$("$CORE/target/release/agyhub" --version)，期望 $VERSION"
   exit 1

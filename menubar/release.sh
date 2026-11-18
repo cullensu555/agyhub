@@ -104,6 +104,26 @@ if [ "$LEAK" = "1" ]; then
 fi
 echo "  ✓ 无外部脚本依赖（纯二进制）"
 
+# ---- 1.6 分发前检查：二进制里不能有编译机的个人路径 ----
+#
+# 仓库是公开的，发出去的安装包也是。Rust 默认会把依赖源码的绝对路径
+# （/Users/<用户名>/.cargo/...）编进内核，build.sh 用 --remap-path-prefix 抹掉了；
+# 这里再兜底查一遍，防止以后有人改坏。
+echo "==> 检查二进制里是否残留个人路径"
+LEAKS=0
+for bin in "$APP/Contents/Resources/agyhub" "$APP/Contents/MacOS/AgyHub"; do
+  n=$(strings -a "$bin" | grep -cF "$HOME" || true)
+  if [ "$n" != "0" ]; then
+    echo "  ⚠ ${bin#$APP/} 里有 $n 处 $HOME"
+    LEAKS=1
+  fi
+done
+if [ "$LEAKS" = "1" ]; then
+  echo "✗ 安装包里带着本机路径（会泄露用户名），停止发版。"
+  exit 1
+fi
+echo "  ✓ 无个人路径"
+
 # 2. 打 DMG
 # 用 hdiutil create 的 -srcfolder，比先建空盘再拷简单，也不会有残留挂载点
 DMG="$RELEASE_DIR/AgyHub-$VERSION.dmg"
