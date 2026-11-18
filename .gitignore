@@ -1,0 +1,76 @@
+# ============================================================
+# AgyHub —— 提交前必读
+#
+# 这个仓库只提交**源码**。运行时产物、依赖、日志、证书
+# 一律不进版本库，原因各异，逐条写在下面。
+#
+# ⚠️ 本文件里**不要写行内注释**（`xxx/  # 说明` 这种）。
+# gitignore 不支持行尾注释，会把 `  # 说明` 当成匹配模式的一部分，
+# 导致该条规则实际失效。注释一律单独占一行。
+# ============================================================
+
+# ---- 敏感：等同私钥，泄漏就要全部重签 ----
+# 本地根 CA 的私钥一旦泄漏，别人可以伪造任何网站证书。
+.agy-certs/
+.agyr_token
+.agyphone_token
+*.key
+*.pem
+*.srl
+# 本机根证书导出（配套私钥在上面，整目录一起忽略更安全）
+Antigravity本地根证书.crt
+
+# ---- 依赖与构建产物 ----
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Rust 编译产物（约 850MB）。cargo build 会重新生成。
+agyhub-rs/target/
+**/target/
+
+# Swift App 打包产物
+menubar/build/
+menubar/.build/
+*.app
+
+# Node
+node_modules/
+package-lock.json
+
+# ---- 运行时状态 ----
+*.pid
+*.log
+*.sock
+# 运行时配置与缓存（含口令、端口、中文开关、内置图标）
+.agyhub-*/
+# SSH ControlMaster socket
+.ssh-cm/
+
+# ---- 本机设置 ----
+config.conf
+.DS_Store
+.srl
+
+# ---- WorkBuddy 会话数据（个人工作记录，不属于源码）----
+.workbuddy/
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
+*.swp
+
+# ---- 打包产物 ----
+*.tar.gz
+*.zip
+
+# ---- Sparkle 发版工具（二进制，约 107MB）----
+# release.sh 需要它来签名和生成 appcast。
+# 不提交进库（体积大、可从官网重下）。
+menubar/vendor/
+
+# ---- 构建与发布产物 ----
+menubar/release/
+menubar/update/
+menubar/dist/

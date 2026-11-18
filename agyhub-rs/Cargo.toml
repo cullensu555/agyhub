@@ -1,0 +1,56 @@
+[package]
+name = "agyhub"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Antigravity Hub — 把 Antigravity 的网页界面开放给手机和局域网"
+license = "MIT"
+
+[dependencies]
+# 注意：CDP 客户端（src/cdp.rs）**没有用 tokio-tungstenite**。
+#
+# 试过，但 connect_async 在本机会静默挂住（不返回、不报错、超时也不触发），
+# 而同样的端点上 node 的 WebSocket 是正常的。
+# 所以改成裸 TCP + 手写 WebSocket 帧（CDP 只用文本帧，格式很简单），
+# 反而更可控、更少依赖。
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+
+# HTTP/2 与 TLS
+h2 = "0.4"
+http = "1"
+bytes = "1"
+# rustls 明确指定 ring 后端：默认会拉 aws-lc-rs，它要编译一堆 C，
+# 产物动辄几百 MB，编译还慢。ring 更小更快，功能完全够用。
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pemfile = "2"
+
+# 证书生成（本地根 CA + 服务器证书）
+# 需要 x509-parser：签服务器证书时要能反解已有 CA 的 subject，
+# rcgen 的 from_ca_cert_pem 被这个 feature 门控。
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+
+# 系统信息与进程
+libc = "0.2"
+
+# 图标处理：要把 PNG 的透明区合成到白底（否则安卓 App 图标出现黑边），
+# 需要解压/压缩 IDAT 块。用 flate2 而不是引入 image crate ——
+# 只需要「解 PNG、做 src-over 合成、再编码」，裸操作字节流足够，体积小得多。
+flate2 = "1"
+
+# JSON（manifest、配置）
+serde_json = "1"
+# serde 的 derive 特性：config.rs 里的 Config 要自动派生序列化
+serde = { version = "1", features = ["derive"] }
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
