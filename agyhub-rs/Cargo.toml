@@ -1,6 +1,6 @@
 [package]
 name = "agyhub"
-version = "0.1.0"
+version = "1.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Antigravity Hub — 把 Antigravity 的网页界面开放给手机和局域网"
@@ -33,6 +33,10 @@ rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 
 # 系统信息与进程
 libc = "0.2"
+
+# 证书指纹（SHA-256）。rustls 已经依赖了 ring，这里直接用，不增加编译量。
+# 原来是 fork 一个 `openssl x509 -fingerprint`，每 3 秒一次。
+ring = "0.17"
 
 # 图标处理：要把 PNG 的透明区合成到白底（否则安卓 App 图标出现黑边），
 # 需要解压/压缩 IDAT 块。用 flate2 而不是引入 image crate ——

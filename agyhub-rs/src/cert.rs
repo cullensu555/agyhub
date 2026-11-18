@@ -25,6 +25,30 @@ pub const CA_CERT: &str = "agy-ca.crt";
 pub const CA_KEY: &str = "agy-ca.key";
 pub const SRV_CERT: &str = "agy-gate.crt";
 pub const SRV_KEY: &str = "agy-gate.key";
+/// 记录服务器证书是由哪张 CA（SHA-256 指纹）签的
+const SRV_SIGNER: &str = "agy-gate.signer";
+
+/// CA 证书的 SHA-256 指纹（冒号分隔的大写十六进制，与 openssl 输出格式一致）。
+pub fn ca_fingerprint(ca_pem: &str) -> String {
+    match pem_to_der(ca_pem) {
+        Some(der) => {
+            let d = ring::digest::digest(&ring::digest::SHA256, &der);
+            d.as_ref()
+                .iter()
+                .map(|b| format!("{:02X}", b))
+                .collect::<Vec<_>>()
+                .join(":")
+        }
+        None => String::new(),
+    }
+}
+
+/// 读取已存在的 CA 指纹（不生成任何东西）。
+pub fn existing_ca_fingerprint(dir: &Path) -> String {
+    fs::read_to_string(dir.join(CA_CERT))
+        .map(|s| ca_fingerprint(&s))
+        .unwrap_or_default()
+}
 
 /// 证书与私钥的 PEM 内容。
 pub struct CertBundle {
@@ -39,41 +63,64 @@ pub struct CertBundle {
 /// 手机走局域网访问时用的是 en0 的地址，证书 SAN 里必须包含它，
 /// 否则手机会报证书不匹配。这里同时收录 127.0.0.1 与所有非回环 IPv4。
 pub fn local_ips() -> Vec<IpAddr> {
-    let mut out = vec![IpAddr::from([127, 0, 0, 1])];
+    let mut found: Vec<(u8, IpAddr)> = Vec::new();
 
     // 用 getifaddrs 枚举网卡地址，不依赖外部命令。
     unsafe {
         let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut ifap) != 0 {
-            return out;
-        }
-        let mut cur = ifap;
-        while !cur.is_null() {
-            let ifa = &*cur;
-            if !ifa.ifa_addr.is_null() {
-                let sa = ifa.ifa_addr;
-                if (*sa).sa_family as i32 == libc::AF_INET {
-                    let sin = sa as *const libc::sockaddr_in;
-                    let addr = (*sin).sin_addr.s_addr;
-                    // s_addr 是网络字节序，转成主机序再拆字节
-                    let host = u32::from_be(addr);
-                    let ip = IpAddr::from([
-                        ((host >> 24) & 0xff) as u8,
-                        ((host >> 16) & 0xff) as u8,
-                        ((host >> 8) & 0xff) as u8,
-                        (host & 0xff) as u8,
-                    ]);
-                    if !ip.is_loopback() && !out.contains(&ip) {
-                        out.push(ip);
+        if libc::getifaddrs(&mut ifap) == 0 {
+            let mut cur = ifap;
+            while !cur.is_null() {
+                let ifa = &*cur;
+                // 只要处于 UP 状态的网卡：断开的 Wi-Fi 留着的旧地址手机连不上
+                let up = (ifa.ifa_flags & libc::IFF_UP as u32) != 0;
+                if up && !ifa.ifa_addr.is_null() && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET {
+                    let sin = ifa.ifa_addr as *const libc::sockaddr_in;
+                    // s_addr 是网络字节序
+                    let ip = IpAddr::from(u32::from_be((*sin).sin_addr.s_addr).to_be_bytes());
+                    let name = if ifa.ifa_name.is_null() {
+                        String::new()
+                    } else {
+                        std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy().into_owned()
+                    };
+                    if !ip.is_loopback() && !found.iter().any(|(_, x)| *x == ip) {
+                        found.push((iface_rank(&name, &ip), ip));
                     }
                 }
+                cur = (*cur).ifa_next;
             }
-            cur = (*cur).ifa_next;
+            libc::freeifaddrs(ifap);
         }
-        libc::freeifaddrs(ifap);
     }
 
+    // ---- 排序：手机最可能连得上的地址排第一 ----
+    //
+    // 菜单里给出的链接用的是第一个非回环地址。原来按网卡枚举顺序取，
+    // 开着公司 VPN（utun）或虚拟机网桥（bridge100）时，经常拿到一个
+    // 手机根本到不了的地址 —— 用户看到的就是"链接打不开"。
+    found.sort_by_key(|(rank, _)| *rank);
+    let mut out = vec![IpAddr::from([127, 0, 0, 1])];
+    out.extend(found.into_iter().map(|(_, ip)| ip));
     out
+}
+
+/// 网卡优先级（越小越优先）。
+fn iface_rank(name: &str, ip: &IpAddr) -> u8 {
+    let link_local = matches!(ip, IpAddr::V4(v4) if v4.is_link_local());
+    if link_local {
+        return 9;
+    }
+    // en* = Wi-Fi / 有线网卡（en0 在笔记本上通常是 Wi-Fi）
+    if name.starts_with("en") {
+        return 0;
+    }
+    // VPN、虚拟机网桥、点对点链路：手机一般到不了
+    for p in ["utun", "ipsec", "ppp", "bridge", "vmnet", "vboxnet", "awdl", "llw", "anpi", "gif", "stf", "ap"] {
+        if name.starts_with(p) {
+            return 5;
+        }
+    }
+    3
 }
 
 /// 读取或生成证书。
@@ -90,6 +137,30 @@ pub fn local_ips() -> Vec<IpAddr> {
 ///   2. `~/.agyhub/certs`（本程序自己的）
 ///   3. 项目内 `.agy-certs`（Python 版在用，**大概率已受信任**）
 pub fn ensure_certs(dir: &Path) -> io::Result<CertBundle> {
+    // ---- 加锁：同一时刻只允许一个进程生成/改写证书 ----
+    //
+    // 首次启动时网关进程和 `trust-cert`（App 自动装证书）几乎同时运行，
+    // 两边都发现"没有 CA"就会各生成一张、互相覆盖：
+    // 网关用 CA#1 签的证书，钥匙串里装的却是 CA#2 ——
+    // 结果就是"证书明明装了，浏览器还是报不安全"。
+    fs::create_dir_all(dir)?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(".lock"))?;
+    use std::os::unix::io::AsRawFd;
+    unsafe {
+        libc::flock(lock.as_raw_fd(), libc::LOCK_EX);
+    }
+    let r = ensure_certs_locked(dir);
+    unsafe {
+        libc::flock(lock.as_raw_fd(), libc::LOCK_UN);
+    }
+    r
+}
+
+fn ensure_certs_locked(dir: &Path) -> io::Result<CertBundle> {
     // 若自己的目录里还没有 CA，先看 Python 版的能不能直接拿来用
     let ca_cert_p = dir.join(CA_CERT);
     let ca_key_p = dir.join(CA_KEY);
@@ -127,7 +198,16 @@ pub fn ensure_certs(dir: &Path) -> io::Result<CertBundle> {
     // 注意：如果本机 IP 变了（换 WiFi），旧证书的 SAN 就对不上，
     // 手机会报证书错误。所以这里检查 SAN 是否覆盖当前所有 IP，
     // 不覆盖就重新签发。
-    let need_reissue = if srv_cert_p.exists() && srv_key_p.exists() {
+    //
+    // 另外要确认服务器证书是**当前这张 CA** 签的：CA 被重新生成过时，
+    // 旧服务器证书的签发者已经不在信任链里了。用一个记录文件保存
+    // "签发时用的 CA 指纹"，对不上就重签。
+    let ca_fp = ca_fingerprint(&ca_cert_pem);
+    let signer_p = dir.join(SRV_SIGNER);
+    let signer_ok = fs::read_to_string(&signer_p)
+        .map(|s| s.trim() == ca_fp)
+        .unwrap_or(false);
+    let need_reissue = if srv_cert_p.exists() && srv_key_p.exists() && signer_ok {
         let existing = fs::read_to_string(&srv_cert_p)?;
         !san_covers_local_ips(&existing)
     } else {
@@ -138,6 +218,7 @@ pub fn ensure_certs(dir: &Path) -> io::Result<CertBundle> {
         let (c, k) = sign_server_cert(&ca_cert_pem, &ca_key_pem)?;
         write_secure(&srv_cert_p, &c)?;
         write_secure(&srv_key_p, &k)?;
+        let _ = fs::write(&signer_p, &ca_fp);
         (c, k)
     } else {
         (
@@ -355,8 +436,84 @@ fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
 /// 若把 http/1.1 放前面，浏览器就用 HTTP/1.1 —— 6 个流式订阅会占满
 /// 连接槽位，页面能看但一操作就卡。
 pub fn tls_acceptor(bundle: &CertBundle) -> io::Result<tokio_rustls::TlsAcceptor> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let (acc, _) = tls_acceptor_dynamic(bundle)?;
+    Ok(acc)
+}
+
+/// 可热替换的服务器证书。
+///
+/// ## 为什么需要热替换
+///
+/// 服务器证书的 SAN 里写死了签发那一刻的局域网 IP。笔记本换个 Wi-Fi，
+/// IP 变了，菜单里显示的新链接用新 IP，但正在运行的网关手里还是旧证书 ——
+/// 手机打开就报"证书与域名不匹配"，必须重启服务才好。
+///
+/// 现在网关每 30 秒看一次本机 IP，变了就重签并原地换证书，
+/// 已有连接不受影响，新连接直接拿到新证书。
+#[derive(Debug)]
+pub struct DynCert {
+    inner: std::sync::RwLock<std::sync::Arc<rustls::sign::CertifiedKey>>,
+}
+
+impl DynCert {
+    pub fn replace(&self, bundle: &CertBundle) -> io::Result<()> {
+        let ck = certified_key(bundle)?;
+        if let Ok(mut g) = self.inner.write() {
+            *g = std::sync::Arc::new(ck);
+        }
+        Ok(())
+    }
+}
+
+impl rustls::server::ResolvesServerCert for DynCert {
+    fn resolve(
+        &self,
+        _hello: rustls::server::ClientHello<'_>,
+    ) -> Option<std::sync::Arc<rustls::sign::CertifiedKey>> {
+        self.inner.read().ok().map(|g| g.clone())
+    }
+}
+
+fn certified_key(bundle: &CertBundle) -> io::Result<rustls::sign::CertifiedKey> {
+    let (certs, key) = parse_bundle(bundle)?;
+    let signer = rustls::crypto::ring::sign::any_supported_type(&key).map_err(to_io)?;
+    Ok(rustls::sign::CertifiedKey::new(certs, signer))
+}
+
+/// 构建 TLS acceptor，同时返回证书句柄供热替换。
+pub fn tls_acceptor_dynamic(
+    bundle: &CertBundle,
+) -> io::Result<(tokio_rustls::TlsAcceptor, std::sync::Arc<DynCert>)> {
     use rustls::ServerConfig;
+
+    let dyn_cert = std::sync::Arc::new(DynCert {
+        inner: std::sync::RwLock::new(std::sync::Arc::new(certified_key(bundle)?)),
+    });
+
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let mut cfg = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(to_io)?
+        .with_no_client_auth()
+        .with_cert_resolver(dyn_cert.clone());
+
+    // ALPN：h2 必须在最前
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    Ok((
+        tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(cfg)),
+        dyn_cert,
+    ))
+}
+
+/// 把 PEM 解析成 rustls 需要的证书链与私钥。
+fn parse_bundle(
+    bundle: &CertBundle,
+) -> io::Result<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use std::io::BufReader;
 
     // rustls-pemfile 2.x 的 API：返回迭代器
@@ -387,13 +544,5 @@ pub fn tls_acceptor(bundle: &CertBundle) -> io::Result<tokio_rustls::TlsAcceptor
         }
     };
 
-    let mut cfg = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(to_io)?;
-
-    // ALPN：h2 必须在最前
-    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
-    Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(cfg)))
+    Ok((certs, key))
 }

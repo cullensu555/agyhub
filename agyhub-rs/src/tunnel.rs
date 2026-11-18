@@ -77,14 +77,22 @@ impl RemoteTunnel {
             self.target, candidates
         ));
 
-        let local = if self.local_port == 0 {
-            pick_free_port()?
-        } else {
-            self.local_port
-        };
+        // 先把旧的 ssh 子进程和后台复用连接都收掉（重连时）。
+        // 网络断过之后旧的复用连接可能已经半死不活，复用它只会让新转发也挂住。
+        self.stop();
+        set_active_target(&self.target);
+        shutdown_master();
 
         let mut tried = Vec::new();
         for rp in &candidates {
+            // ⚠️ 每个候选端口用**新的**本地端口。
+            //
+            // 开了 ControlMaster 复用后，-L 转发登记在后台的 master 连接上，
+            // 杀掉我们这个 ssh 子进程并不一定会撤掉转发。
+            // 如果所有候选都复用同一个本地端口，第一个候选失败后它的转发
+            // 还占着这个端口，后面的候选全都 "Address already in use" ——
+            // 远端 HTTPS 端口恰好排在 HTTP 端口前面时，SSH 网页版就永远起不来。
+            let local = pick_free_port()?;
             match self.open_forward(*rp, local) {
                 Ok(proc) => {
                     // ⚠️ 必须等端口真的可连再 probe。
@@ -99,12 +107,14 @@ impl RemoteTunnel {
                         let mut p = proc;
                         let _ = p.kill();
                         let _ = p.wait();
+                        self.cancel_forward(local, *rp);
                         continue;
                     }
 
                     // probe 必须打在**已映射到本机**的端口上。
                     // 直接探远端端口探到的是本机服务，没有任何意义。
                     if probe_http(local) {
+                        SSH_CHILD_PID.store(proc.id(), std::sync::atomic::Ordering::SeqCst);
                         self.proc = Some(proc);
                         self.local_port = local;
                         self.remote_port = *rp;
@@ -118,6 +128,7 @@ impl RemoteTunnel {
                     let mut p = proc;
                     let _ = p.kill();
                     let _ = p.wait();
+                    self.cancel_forward(local, *rp);
                 }
                 Err(e) => tried.push(format!("{}({})", rp, e)),
             }
@@ -184,25 +195,36 @@ impl RemoteTunnel {
 
     /// 在远端执行命令，返回 stdout。
     fn ssh_run(&self, command: &str) -> io::Result<String> {
-        let out = Command::new("ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                &self.target,
-                command,
-            ])
-            .output()?;
+        let mut cmd = Command::new("ssh");
+        cmd.args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            // ⚠️ 不复用、也不创建复用连接。
+            // 用户自己的 ~/.ssh/config 里常有 ControlMaster auto + ControlPersist：
+            // 那样这条命令会在后台留下一个复用连接，它一直握着我们读取输出的管道，
+            // 读取就永远等不到结束 —— SSH 网页版卡在"正在连接开发机…"。
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+            &self.target,
+            command,
+        ]);
+        // ConnectTimeout 只管建连；连上之后远端卡住也不能无限等
+        let out = crate::sys::output_timeout(cmd, Duration::from_secs(40)).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("ssh {} 执行超时（40 秒）", self.target),
+            )
+        })?;
 
         if !out.status.success() {
+            let raw = String::from_utf8_lossy(&out.stderr).trim().to_string();
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!(
-                    "ssh {} 执行失败: {}",
-                    self.target,
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
+                format!("ssh {} 失败：{}{}", self.target, raw, ssh_hint(&raw)),
             ));
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
@@ -227,8 +249,9 @@ impl RemoteTunnel {
     fn open_forward(&self, remote_port: u16, local_port: u16) -> io::Result<Child> {
         let control_dir = control_dir();
         let _ = std::fs::create_dir_all(&control_dir);
+        crate::sys::chmod_700(std::path::Path::new(&control_dir));
 
-        let control_path = format!("{}/%r@%h-%p", control_dir);
+        let control_path = control_path();
 
         let child = Command::new("ssh")
             .args([
@@ -251,42 +274,133 @@ impl RemoteTunnel {
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            // ⚠️ 不能用 piped()：ssh -N 会常驻，没人读的管道写满 64KB 后
+            // ssh 就阻塞在 write 上，隧道随之卡死。
+            // 继承父进程的 stderr = 直接写进 AgyHub-sshweb.log，出错时也看得到原因。
+            .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| io::Error::new(e.kind(), format!("拉起 ssh 失败: {}", e)))?;
 
         Ok(child)
     }
 
-    /// 隧道是否还活着（进程在 + 端口可连）。
+    /// 隧道是否还活着（端到端：通过隧道能拿到 Antigravity 首页）。
+    ///
+    /// 原来只看本地端口能不能连上。但本地端口由 ssh（或后台的 ControlMaster）
+    /// 监听，远端 language_server 重启换了端口后，本地端口照样能连上，
+    /// 只是每个请求都失败 —— 于是永远不触发重连，SSH 网页版一直打不开。
     pub fn alive(&self) -> bool {
         match &self.proc {
             None => false,
-            Some(_) => {
-                // 端口能连上就认为活着。
-                // 不用 try_wait 是因为 ssh -N 会一直挂着，
-                // 真正的死法是端口不通。
-                TcpStream::connect_timeout(
-                    &format!("127.0.0.1:{}", self.local_port).parse().unwrap(),
-                    Duration::from_millis(500),
-                )
-                .is_ok()
-            }
+            Some(_) => probe_http(self.local_port),
         }
     }
 
-    /// 停止隧道。
+    /// 停止隧道（只停前台 ssh 子进程；后台复用连接由 [`shutdown_master`] 处理）。
     pub fn stop(&mut self) {
         if let Some(mut p) = self.proc.take() {
             let _ = p.kill();
             let _ = p.wait();
         }
+        SSH_CHILD_PID.store(0, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// 撤掉复用连接上某条转发（候选端口试失败时用）。
+    ///
+    /// 转发登记在后台的复用连接上，杀掉前台 ssh 不会撤掉它，
+    /// 不撤的话失败的候选会一直占着本地端口。
+    fn cancel_forward(&self, local: u16, remote: u16) {
+        let mut cmd = Command::new("ssh");
+        cmd.args([
+            "-o",
+            &format!("ControlPath={}", control_path()),
+            "-O",
+            "cancel",
+            "-L",
+            &format!("127.0.0.1:{}:127.0.0.1:{}", local, remote),
+            &self.target,
+        ]);
+        let _ = crate::sys::output_timeout(cmd, Duration::from_secs(5));
+    }
+}
+
+/// 当前 ssh 子进程的 pid。
+///
+/// 网关被 SIGTERM 停掉时 Rust 不会跑析构函数，`Drop` 里的清理不会执行，
+/// ssh 子进程就成了孤儿（每重启一次 SSH 网页版就多留一个）。
+/// 信号处理里读这个值把它杀掉。
+pub static SSH_CHILD_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 当前连的开发机（关闭复用连接时要用）。
+static ACTIVE_TARGET: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+fn set_active_target(t: &str) {
+    if let Ok(mut g) = ACTIVE_TARGET.lock() {
+        *g = t.to_string();
+    }
+}
+
+/// 关掉 AgyHub 专用的 SSH 复用连接（连同上面的所有转发）。
+///
+/// ## 为什么必须做
+///
+/// `ControlPersist=600` 会让第一条 ssh 在后台留一个复用连接（master），
+/// 端口转发实际挂在它上面。只杀前台的 ssh 子进程，master 和转发还会
+/// 再活 10 分钟：停了 SSH 网页版，本地端口和到开发机的连接却都还在。
+///
+/// 复用连接用的是 AgyHub 专用的 socket（`agyhub-%C`），不会碰到用户自己的
+/// ssh 复用连接，所以这里可以放心 `-O exit`。
+pub fn shutdown_master() {
+    let target = ACTIVE_TARGET.lock().map(|g| g.clone()).unwrap_or_default();
+    if target.is_empty() {
+        return;
+    }
+    let mut cmd = Command::new("ssh");
+    cmd.args([
+        "-o",
+        &format!("ControlPath={}", control_path()),
+        "-O",
+        "exit",
+        &target,
+    ]);
+    let _ = crate::sys::output_timeout(cmd, Duration::from_secs(5));
+}
+
+/// 退出时的清理：前台 ssh 子进程 + 后台复用连接。
+pub fn cleanup() {
+    let pid = SSH_CHILD_PID.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if pid > 0 {
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+    shutdown_master();
 }
 
 impl Drop for RemoteTunnel {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// 把 ssh 的英文报错翻成用户该做的事。
+fn ssh_hint(stderr: &str) -> &'static str {
+    let s = stderr.to_ascii_lowercase();
+    if s.contains("permission denied") {
+        "\n→ 需要密钥免密登录：在终端执行 ssh-copy-id <主机名>，确认 ssh <主机名> 不再要密码"
+    } else if s.contains("host key verification failed") {
+        "\n→ 先在终端手动 ssh 一次这台机器，输入 yes 接受主机指纹"
+    } else if s.contains("could not resolve hostname") {
+        "\n→ 主机名解析失败：检查 ~/.ssh/config 里的 HostName"
+    } else if s.contains("no route to host") {
+        "\n→ 连不上这台机器：检查网络 / VPN；开发机在局域网内的话，\
+         还要在「系统设置 → 隐私与安全性 → 本地网络」里允许 AgyHub"
+    } else if s.contains("timed out") {
+        "\n→ 连不上这台机器：检查网络 / VPN"
+    } else if s.contains("connection refused") {
+        "\n→ 对方没开 SSH 服务或端口不对"
+    } else {
+        ""
     }
 }
 
@@ -297,6 +411,15 @@ impl Drop for RemoteTunnel {
 fn control_dir() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     format!("{}/.ssh/cm", home)
+}
+
+/// AgyHub 专用的复用 socket 路径。
+///
+/// `%C` 是连接参数的哈希（定长 40 字符）：
+///   · 和用户自己的 `%r@%h-%p` 复用连接分开，关闭时不会误伤
+///   · 定长，不会因为主机名太长超过 unix socket 104 字节的路径上限
+fn control_path() -> String {
+    format!("{}/agyhub-%C", control_dir())
 }
 
 /// 挑一个空闲的本地端口。

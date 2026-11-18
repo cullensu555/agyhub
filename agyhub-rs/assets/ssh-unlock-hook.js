@@ -1,9 +1,19 @@
 
 (function(){
-  if (window.__AGY_SSH_UNLOCK__) return;
-  window.__AGY_SSH_UNLOCK__ = { hits: 0, patched: 0, errors: [] };
+  // ⚠️ 这个文件是原样注入页面的（include_str!），不经过任何模板替换。
+  // 从 node 版迁移时这里残留过 `${JSON.stringify(TARGET_FLAG)}`，
+  // 那是 node 模板字符串的占位符，在普通 JS 里是语法错误 ——
+  // 整个钩子从来没执行成功过。改动后请用 `node --check` 检查一遍。
+  var S = window.__AGY_SSH_UNLOCK__;
+  if (S && !S.off) return true;
+  if (S && S.off && S.realFetch) {
+    // 之前被关掉过：重新打开即可，不要再包一层 fetch
+    S.off = false;
+    return true;
+  }
+  window.__AGY_SSH_UNLOCK__ = { hits: 0, patched: 0, errors: [], off: false, realFetch: null };
 
-  var TARGET = ${JSON.stringify(TARGET_FLAG)};
+  var TARGET = 'enable-ssh-remote';
 
   function patchFrames(bytes) {
     var chunks = [], pos = 0, changed = false, touched = 0;
@@ -66,11 +76,12 @@
   }
 
   var realFetch = window.fetch;
+  window.__AGY_SSH_UNLOCK__.realFetch = realFetch;
   window.fetch = function (input, init) {
     var url = String(
       typeof input === 'string' ? input : (input && input.url) || ''
     );
-    if (url.indexOf('GetMendelFlags') === -1) {
+    if (window.__AGY_SSH_UNLOCK__.off || url.indexOf('GetMendelFlags') === -1) {
       return realFetch.apply(this, arguments);
     }
 
@@ -125,4 +136,5 @@
       });
     });
   };
+  return true;
 })();

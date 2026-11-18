@@ -643,7 +643,24 @@ const INSTALL_HINT: &str = r#"<style id="agy-install-hint-style">
     return w > 0 && w < 640;
   }
   if (standalone()) { return; }
-  try { if (localStorage.getItem('__agyHintOff') === '1') { return; } } catch (e) {}
+  // 两条提示分开记"已关闭"：
+  //   · 安装成应用的提示：关一次永久不再显示（localStorage）
+  //   · 证书不受信任的警告：只在本次会话内不再显示（sessionStorage）——
+  //     原来两者共用一个开关，用户关掉过"安装提示"后，
+  //     证书出问题时警告也永远不出来了。
+  function off(kind) {
+    try {
+      return kind === 'cert'
+        ? sessionStorage.getItem('__agyCertHintOff') === '1'
+        : localStorage.getItem('__agyHintOff') === '1';
+    } catch (e) { return false; }
+  }
+  function setOff(kind) {
+    try {
+      if (kind === 'cert') { sessionStorage.setItem('__agyCertHintOff', '1'); }
+      else { localStorage.setItem('__agyHintOff', '1'); }
+    } catch (e) {}
+  }
 
   // 证书是否受信任。
   //
@@ -666,6 +683,7 @@ const INSTALL_HINT: &str = r#"<style id="agy-install-hint-style">
     // 因为这时连 PWA 都装不了，功能实际是残的。
     // 而"可以装成应用"这种锦上添花的提示只在窄屏（手机）显示。
     if (insecure) {
+      if (off('cert')) { return; }
       var mobile = narrow();
       var msg = '<b>⚠️ 证书未受信任</b><br>'
         + '这会让页面显示「不安全」，也无法装成应用。'
@@ -677,14 +695,17 @@ const INSTALL_HINT: &str = r#"<style id="agy-install-hint-style">
         + '4. 完全关闭浏览器再打开本页<br><br>'
         + '<span style="opacity:.7;font-size:12px">'
         + (mobile
-            ? 'iPhone：设置 → 通用 → 关于本机 → 证书信任设置 → 打开开关<br>'
-              + '安卓：设置 → 安全 → 加密与凭据 → 安装证书 → CA 证书'
-            : 'macOS：双击 ca.crt → 钥匙串访问 → 找到证书 → 改为「始终信任」')
+            ? '<b>iPhone（必须用 Safari 打开本页）</b>：点上面的链接 →「允许」下载描述文件 → '
+              + '打开「设置」，顶部点「已下载描述文件」→ 安装 → '
+              + '再去 设置 → 通用 → 关于本机 → 证书信任设置 → 打开「Antigravity Local CA」开关<br>'
+              + '<b>安卓</b>：下载后去 设置 → 安全 → 加密与凭据 → 安装证书 → CA 证书 → 选择刚下载的文件'
+            : '<b>Mac</b>：在电脑菜单栏点 AgyHub →「安装根证书」即可自动完成；'
+              + '手动安装：双击 ca.crt → 钥匙串访问 → 找到证书 → 改为「始终信任」')
         + '</span>';
       d.innerHTML = '<div class="t">' + msg + '</div>'
         + '<button aria-label="关闭">&times;</button>';
       d.querySelector('button').addEventListener('click', function () {
-        try { localStorage.setItem('__agyHintOff', '1'); } catch (e) {}
+        setOff('cert');
         d.remove();
       });
       document.body.appendChild(d);
@@ -692,7 +713,7 @@ const INSTALL_HINT: &str = r#"<style id="agy-install-hint-style">
     }
 
     // 证书正常：只在手机上提示"可以装成应用"
-    if (!narrow()) { return; }
+    if (!narrow() || off('install')) { return; }
     var msg2 = '<b>可以装成应用。</b><br>'
       + '安卓 Chrome：右上角菜单 →「安装应用 / 添加到主屏幕」；'
       + 'iPhone Safari：分享 →「添加到主屏幕」。'
@@ -700,7 +721,7 @@ const INSTALL_HINT: &str = r#"<style id="agy-install-hint-style">
     d.innerHTML = '<div class="t">' + msg2 + '</div>'
       + '<button aria-label="关闭">&times;</button>';
     d.querySelector('button').addEventListener('click', function () {
-      try { localStorage.setItem('__agyHintOff', '1'); } catch (e) {}
+      setOff('install');
       d.remove();
     });
     document.body.appendChild(d);
@@ -804,31 +825,44 @@ pub enum AgyStatus {
     NotRunning,
     /// 运行中，但找不到上游端口（多半是没登录 / 还在启动）
     NoUpstream,
+    /// SSH 网页版：到开发机的隧道断了，正在重连
+    RemoteDown,
+}
+
+/// Antigravity 是否已安装（/Applications 或 ~/Applications）。
+pub fn antigravity_installed() -> bool {
+    let home = crate::sys::home();
+    [
+        std::path::PathBuf::from("/Applications/Antigravity.app"),
+        std::path::PathBuf::from("/Applications/Antigravity Beta.app"),
+        home.join("Applications/Antigravity.app"),
+    ]
+    .iter()
+    .any(|p| p.exists())
+}
+
+/// Antigravity 主进程是否在跑。
+///
+/// 用 proc_listallpids + proc_pidpath 直接问内核，不调 pgrep/ps
+/// （这两个在某些管控环境下会被拦截）。
+pub fn antigravity_running() -> bool {
+    !crate::sys::find_pids(|p| {
+        p.ends_with(".app/Contents/MacOS/Antigravity") && p.contains("Antigravity")
+    })
+    .is_empty()
 }
 
 /// 判断 Antigravity 的状态。
 pub fn detect_status() -> AgyStatus {
-    // 1. 装了吗
-    let installed = std::path::Path::new("/Applications/Antigravity.app").exists()
-        || std::path::Path::new("/Applications/Antigravity Beta.app").exists();
-    if !installed {
+    if crate::upstream::remote_port().is_some() {
+        return AgyStatus::RemoteDown;
+    }
+    if !antigravity_installed() {
         return AgyStatus::NotInstalled;
     }
-
-    // 2. 运行了吗
-    //
-    // 用 pgrep 而不是 pidof：macOS 没有 pidof。
-    // 匹配主可执行文件名足够，不必精确到路径（路径可能变）。
-    let running = std::process::Command::new("pgrep")
-        .args(["-f", "Antigravity.app/Contents/MacOS"])
-        .output()
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
-
-    if !running {
+    if !antigravity_running() {
         return AgyStatus::NotRunning;
     }
-
     AgyStatus::NoUpstream
 }
 
@@ -865,6 +899,18 @@ pub fn guide_html(status: AgyStatus, lan_ip: &str, port: u16) -> String {
             </ol>
             <p class="hint">小提示：勾选菜单栏 AgyHub 里的「登录时启动」，
                以后开机就会自动就绪。</p>
+            "#,
+        ),
+        AgyStatus::RemoteDown => (
+            "开发机连接中断",
+            "🔌",
+            r#"
+            <p>到开发机的 SSH 隧道暂时断开了，网关正在自动重连（约 30 秒内）。</p>
+            <ol>
+              <li>稍等片刻后点下面的「重新检测」</li>
+              <li>如果一直不行：确认电脑还能 <code>ssh</code> 到这台开发机（VPN 是否断开）</li>
+              <li>开发机上的 Antigravity 服务可能被重启过：在 Mac 桌面版连一次这台机器即可恢复</li>
+            </ol>
             "#,
         ),
         AgyStatus::NoUpstream => (

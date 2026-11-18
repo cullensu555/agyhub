@@ -109,8 +109,17 @@ echo "  ✓ 无外部脚本依赖（纯二进制）"
 DMG="$RELEASE_DIR/AgyHub-$VERSION.dmg"
 echo "==> 打 DMG"
 /bin/rm -f "$DMG"
-hdiutil create -volname "AgyHub" -srcfolder "$APP" -ov -format UDZO -quiet "$DMG"
+# 盘里放 App + 「应用程序」的快捷方式：用户一看就知道要拖过去。
+# 原来盘里只有一个 AgyHub.app，很多人直接在盘里双击运行 ——
+# 推出安装盘 App 就没了，登录项和自动更新也都指向一个不存在的路径。
+STAGE="$(mktemp -d)"
+cp -R "$APP" "$STAGE/"
+ln -s /Applications "$STAGE/Applications"
+hdiutil create -volname "AgyHub" -srcfolder "$STAGE" -ov -format UDZO -quiet "$DMG"
+/bin/rm -rf "$STAGE"
 echo "  $DMG ($(du -h "$DMG" | cut -f1))"
+SHA256=$(shasum -a 256 "$DMG" | cut -d' ' -f1)
+echo "  sha256: $SHA256"
 
 # 3. 签名
 echo "==> 用 Sparkle 私钥签名"
@@ -160,6 +169,13 @@ cat > "$UPDATE_DIR/appcast-aarch64.xml" <<XML
 XML
 
 cp "$DMG" "$UPDATE_DIR/"
+
+# 5. 同步 Homebrew cask 的版本号和校验和（cask 里写死的旧值会让 brew 安装直接失败）
+CASK="$ROOT/../packaging/agyhub.rb"
+if [ -f "$CASK" ]; then
+  sed -i '' -E "s/^  version \".*\"/  version \"$VERSION\"/; s/^  sha256 \".*\"/  sha256 \"$SHA256\"/" "$CASK"
+  echo "==> 已更新 packaging/agyhub.rb（version $VERSION, sha256 ${SHA256:0:12}…）"
+fi
 
 echo
 echo "✓ 完成"

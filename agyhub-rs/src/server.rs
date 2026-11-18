@@ -30,12 +30,77 @@ use tokio_rustls::TlsAcceptor;
 
 /// 全局配置。
 pub struct Ctx {
-    pub token: String,
+    pub token: TokenSource,
     pub verbose: bool,
     /// 根证书 PEM，供 `/__agy/ca.crt` 下载安装。
     pub ca_pem: String,
     /// 当前监听端口，引导页上会显示。
     pub port: u16,
+}
+
+/// 访问口令的来源。
+///
+/// ## 为什么不在启动时读一次就完事
+///
+/// 原来口令在启动时读进内存，之后不再变。菜单里「更换访问口令」只改了
+/// 配置文件，正在跑的网关还认旧口令：**新链接打不开（401），旧链接照样能用**，
+/// 和弹窗里说的"旧链接会失效"正好相反，换口令等于没换。
+///
+/// 现在每次校验都取当前值：配置文件里的口令最多缓存 1 秒。
+/// 换口令立即生效，不需要重启服务（SSH 网页版也不用重建隧道）。
+pub struct TokenSource {
+    /// 环境变量 AGEHUB_TOKEN 指定的固定口令（命令行用户用）
+    fixed: Option<String>,
+    cache: std::sync::Mutex<(String, std::time::Instant)>,
+}
+
+impl TokenSource {
+    pub fn new(fixed: Option<String>, initial: String) -> Self {
+        Self {
+            fixed,
+            cache: std::sync::Mutex::new((initial, std::time::Instant::now())),
+        }
+    }
+
+    pub fn get(&self) -> String {
+        if let Some(t) = &self.fixed {
+            return t.clone();
+        }
+        let mut g = match self.cache.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if g.1.elapsed() >= Duration::from_secs(1) {
+            let t = crate::config::Config::load().token;
+            if !t.is_empty() {
+                g.0 = t;
+            }
+            g.1 = std::time::Instant::now();
+        }
+        g.0.clone()
+    }
+}
+
+/// 在阻塞线程池里找上游（lsof/探测都是同步 IO，不能卡住异步工作线程）。
+async fn find_upstream_async(force: bool) -> Option<u16> {
+    tokio::task::spawn_blocking(move || upstream::find_upstream(force))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// 连上游；失败时清掉缓存重新找一次再连。
+///
+/// Antigravity 重启后端口会变，而上游端口有 30 秒缓存 ——
+/// 不重试的话这 30 秒内所有请求都直接断开，页面一片空白。
+async fn connect_upstream() -> Option<(proxy::Conn, u16)> {
+    let port = find_upstream_async(false).await?;
+    if let Ok(c) = proxy::Conn::connect(port).await {
+        return Some((c, port));
+    }
+    upstream::invalidate();
+    let port2 = find_upstream_async(true).await?;
+    proxy::Conn::connect(port2).await.ok().map(|c| (c, port2))
 }
 
 /// 取一个局域网 IP 用于展示（引导页底部显示"本机地址"）。
@@ -105,20 +170,27 @@ async fn end_stream(
     Ok(())
 }
 
+/// 绑定监听端口（与 serve 分开：调用方要在绑定成功后才登记"已就绪"）。
+pub async fn bind(port: u16) -> std::io::Result<TcpListener> {
+    TcpListener::bind(("0.0.0.0", port)).await
+}
+
 /// 启动 HTTPS/HTTP2 服务。
 pub async fn serve(
-    port: u16,
+    listener: TcpListener,
     tls: TlsAcceptor,
     ctx: Arc<Ctx>,
 ) -> std::io::Result<()> {
-    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    tracing::info!("监听 0.0.0.0:{} (HTTPS/HTTP2)", port);
+    tracing::info!("监听 0.0.0.0:{} (HTTPS/HTTP2)", ctx.port);
 
     loop {
         let (sock, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
+                // 文件句柄耗尽（EMFILE）时 accept 会立刻反复失败，
+                // 不歇一下就是一个打满 CPU 的死循环。
                 tracing::warn!("accept 失败: {}", e);
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
@@ -237,7 +309,8 @@ async fn handle(
     }
 
     // ---- 口令 ----
-    if !token_ok(&headers, &path, &ctx.token) {
+    let token = ctx.token.get();
+    if !token_ok(&headers, &path, &token) {
         let body = AUTH_PAGE.as_bytes().to_vec();
         let resp = Response::builder()
             .status(StatusCode::UNAUTHORIZED)
@@ -257,13 +330,13 @@ async fn handle(
     // （现象：上传附件后发送按钮一直转圈）。
     let req_body = read_body(body, &ctx).await?;
 
-    // ---- 找上游 ----
-    let port = match upstream::find_upstream(false) {
-        Some(p) => p,
+    // ---- 找上游并连上 ----
+    let (mut up, port) = match connect_upstream().await {
+        Some(v) => v,
         None => {
             // 上游不可用 → 给引导页，而不是一句"not running"。
             //
-            // 区分三种情况（没装 / 没开 / 没登录），
+            // 区分几种情况（没装 / 没开 / 没登录 / 开发机断线），
             // 因为用户该做的事完全不同。详见 inject::guide_html。
             let status = inject::detect_status();
             let html = inject::guide_html(status, &local_ip(), ctx.port);
@@ -284,7 +357,6 @@ async fn handle(
         }
     };
 
-    let mut up = proxy::Conn::connect(port).await?;
     up.send_request(method.as_str(), &path, &headers, &req_body, port)
         .await?;
 
@@ -314,12 +386,12 @@ async fn handle(
         // 用 Long Max-Age（400 天）：装成 PWA 后要长期免输口令。
         // HttpOnly：JS 读不到，减少 XSS 泄口令面。
         // SameSite=Lax：同站正常，跨站不带，避免被别站引用。
-        if !ctx.token.is_empty() && path.contains(&ctx.token) {
+        if !token.is_empty() && path.contains(&token) {
             r = r.header(
                 "set-cookie",
                 format!(
                     "agygate={}; Path=/; Max-Age=34560000; HttpOnly; SameSite=Lax",
-                    ctx.token
+                    token
                 ),
             );
         }
@@ -455,21 +527,45 @@ async fn ws_tunnel(
         .collect();
     let mut body = req.into_body();
 
-    let port = match upstream::find_upstream(false) {
+    // WebSocket 同样要鉴权：原来这里没查口令，
+    // 知道端口的人不带口令也能直接连上实时通道。
+    if !token_ok(&headers, &path, &ctx.token.get()) {
+        let resp = Response::builder().status(StatusCode::UNAUTHORIZED).body(())?;
+        let mut s = respond.send_response(resp, true)?;
+        let _ = s.send_data(Bytes::new(), true);
+        return Ok(());
+    }
+
+    let bad_gateway = |mut respond: h2::server::SendResponse<Bytes>| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let resp = Response::builder().status(StatusCode::BAD_GATEWAY).body(())?;
+        let mut s = respond.send_response(resp, true)?;
+        let _ = s.send_data(Bytes::new(), true);
+        Ok(())
+    };
+
+    let mut port = match find_upstream_async(false).await {
         Some(p) => p,
-        None => {
-            let resp = Response::builder().status(StatusCode::BAD_GATEWAY).body(())?;
-            let mut s = respond.send_response(resp, true)?;
-            let _ = s.send_data(Bytes::new(), true);
-            return Ok(());
-        }
+        None => return bad_gateway(respond),
     };
 
     if ctx.verbose {
         tracing::info!("[ws] {}", path);
     }
 
-    let mut up = TcpStream::connect((proxy::UPSTREAM_HOST, port)).await?;
+    let mut up = match TcpStream::connect((proxy::UPSTREAM_HOST, port)).await {
+        Ok(s) => s,
+        Err(_) => {
+            upstream::invalidate();
+            port = match find_upstream_async(true).await {
+                Some(p) => p,
+                None => return bad_gateway(respond),
+            };
+            match TcpStream::connect((proxy::UPSTREAM_HOST, port)).await {
+                Ok(s) => s,
+                Err(_) => return bad_gateway(respond),
+            }
+        }
+    };
     up.set_nodelay(true).ok();
 
     // 组装上游 Upgrade 握手
@@ -684,7 +780,8 @@ const AUTH_PAGE: &str = r#"<!doctype html>
 </style></head><body>
 <div class="box">
   <h1>需要口令才能进入</h1>
-  <p>请使用控制面板里给出的链接打开，链接里带有 <code>?t=</code> 口令。</p>
-  <p class="hint">在电脑上双击「Antigravity手机访问」即可看到完整的地址。</p>
+  <p>请使用电脑上 AgyHub 给出的链接打开，链接里带有 <code>?t=</code> 口令。</p>
+  <p>以前能打开、现在打不开？口令可能刚被更换过。</p>
+  <p class="hint">在电脑屏幕右上角菜单栏点 AgyHub 图标 →「复制链接」或「显示二维码」，重新打开即可。</p>
 </div></body></html>
 "#;

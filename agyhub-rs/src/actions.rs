@@ -1,183 +1,82 @@
-//! SSH 入口解锁与中文还原。
+//! 桌面版 Antigravity 的注入：SSH 入口解锁与中文界面。
 //!
-//! 这两件事原先由外部 node 脚本完成：
+//! 注入用的 JS 编译进二进制（`include_str!`），分发出去不需要任何外部文件。
 //!
-//! | 原脚本 | 现在 |
-//! |---|---|
-//! | `agy-ssh-unlock.cjs` | 本文件的 `unlock_ssh_entry()` |
-//! | `stop-zh.cjs` | 本文件的 `restore_zh_ui()` |
+//! ## 为什么要"巡检 + 补注入"，而不是注入一次就完事
 //!
-//! 注入用的 JS 内容编译进二进制（`include_str!`），
-//! 所以分发出去不需要任何外部文件。
+//! 注入走 CDP。有两个事实决定了必须巡检：
+//!   1. `Page.addScriptToEvaluateOnNewDocument` 登记的脚本**跟着 CDP 会话走**，
+//!      我们的命令一退出、连接一断，登记就失效了。
+//!   2. 页面刷新、开新窗口、Antigravity 重启，都会得到一个干净的新页面。
+//!
+//! 所以"中文界面重启后自动恢复"、"SSH 入口一直在"只能靠：
+//! App 每隔几秒调一次 `agyhub ensure-inject`，发现哪个页面缺了就补上。
+//! 已经注入过的页面只做一次很轻的检查（一条 Runtime.evaluate），不重复注入。
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::cdp::{js_json, Cdp};
+use crate::state;
+use crate::sys;
 
 /// 注入到页面的钩子：篡改 GetMendelFlags 响应，删掉 disabled 标记。
 ///
-/// 内容来自原 `agy-ssh-unlock.cjs` 的 `PAGE_HOOK`。
-/// 原理：Antigravity 服务端的 experiments 里本来就有
-/// `enable-ssh-remote` 这一条，但带 `"disabled": true`。
-/// 这个钩子在响应经过时把该字段删掉，前端就会渲染出 SSH 入口。
+/// 原理：Antigravity 服务端的 experiments 里本来就有 `enable-ssh-remote`
+/// 这一条，但带 `"disabled": true`。钩子在响应经过时把该字段删掉，
+/// 前端就会渲染出 SSH 入口。
 const SSH_UNLOCK_HOOK: &str = include_str!("../assets/ssh-unlock-hook.js");
 
 /// 关闭中文时用来还原界面的 JS。
 const STOP_ZH_RESTORE: &str = include_str!("../assets/stop-zh-restore.js");
 
-/// 一次性解锁 SSH 入口（给当前所有页面装钩子）。
-///
-/// 注意这只是"装钩子"，钩子要等到下一次 `GetMendelFlags` 请求
-/// 才会真正改写响应。用户打开或切换对话时就会触发。
-///
-/// **不能** reload 页面：那会造成无限刷新循环
-/// （attachedToTarget → 注入 → reload → 又被捕获 → …），
-/// 表现是新窗口一直闪白，用户根本来不及操作。
-pub async fn unlock_ssh_entry() -> Result<String, String> {
-    let mut cdp = Cdp::connect().await?;
-    let pages = cdp.list_pages().await?;
-    if pages.is_empty() {
-        return Err("没有找到 Antigravity 页面".into());
-    }
+/// 关闭 SSH 解锁：让钩子直接放行（下次刷新页面后彻底消失）。
+const SSH_UNLOCK_OFF: &str = r#"(function(){
+  var S = window.__AGY_SSH_UNLOCK__;
+  if (S) { S.off = true; }
+  return true;
+})()"#;
 
-    let mut injected = 0;
-    let mut detail = Vec::new();
+/// 页面当前注入情况。
+const PROBE_JS: &str = r#"(function(){
+  var s = window.__AGY_SSH_UNLOCK__;
+  return {
+    zh: !!window.__AGY_ZH__,
+    ssh: !!(s && !s.off),
+    // 钩子真正改写过 GetMendelFlags 响应的次数。为 0 说明钩子装上了，
+    // 但页面还没再请求过开关配置，SSH 入口暂时还不会出现。
+    patched: s ? (s.patched || 0) : 0,
+    ready: document.readyState
+  };
+})()"#;
 
-    for p in &pages {
-        let sid = match cdp.attach(&p.id).await {
-            Ok(s) => s,
-            Err(e) => {
-                detail.push(format!("{}: attach 失败 {}", p.url, e));
-                continue;
-            }
-        };
-        let _ = cdp.send("Page.enable", json!({}), Some(&sid)).await;
+// ## 什么时候允许为 SSH 解锁刷新页面
+//
+// 解锁要刷新一次页面：钩子必须在页面脚本之前装好，才能截到启动时那次
+// GetMendelFlags。但刷新会打断用户正在做的事，所以严格限制：
+//
+//   · 用户刚打开开关（force）：刷新所有窗口 —— 用户预期会有变化
+//   · 新出现的窗口（之前没见过的 target id）：刷新一次
+//   · 见过的窗口钩子丢了（用户自己按了 ⌘R）：**不刷新**，只把钩子装进当前页面，
+//     之后页面再请求 GetMendelFlags（切换对话等）时生效
+//
+// 没有这个限制就会变成老 node 版踩过的坑：每次巡检都刷新，窗口不停闪白。
 
-        // 装钩子：对后续导航生效
-        let r = cdp
-            .send(
-                "Page.addScriptToEvaluateOnNewDocument",
-                json!({ "source": SSH_UNLOCK_HOOK }),
-                Some(&sid),
-            )
-            .await;
-
-        match r {
-            Ok(_) => {
-                // 对当前已加载的文档，立刻执行一次
-                let _ = cdp.eval(&sid, SSH_UNLOCK_HOOK).await;
-                injected += 1;
-                detail.push(format!("已注入: {}", truncate(&p.url, 60)));
-            }
-            Err(e) => detail.push(format!("注入失败 {}: {}", truncate(&p.url, 40), e)),
-        }
-    }
-
-    if injected == 0 {
-        return Err(format!("全部页面注入失败：{}", detail.join("; ")));
-    }
-
-    Ok(format!("已给 {} 个页面装好钩子", injected))
+/// 一次巡检的结果。
+#[derive(Debug, Default)]
+pub struct Report {
+    pub pages: usize,
+    pub zh_ok: usize,
+    pub ssh_ok: usize,
+    /// 钩子已经生效（改写过响应）的页面数
+    pub ssh_active: usize,
+    pub actions: Vec<String>,
+    pub errors: Vec<String>,
 }
 
-/// 查询当前钩子的命中情况（用于诊断）。
-pub async fn ssh_unlock_status() -> Result<serde_json::Value, String> {
-    let mut cdp = Cdp::connect().await?;
-    let pages = cdp.list_pages().await?;
-    let mut out = Vec::new();
-
-    for p in &pages {
-        let sid = match cdp.attach(&p.id).await {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let expr = r#"(function(){
-            var s = window.__AGY_SSH_UNLOCK__;
-            return {
-                hook: !!s,
-                hits: s ? s.hits : -1,
-                patched: s ? s.patched : -1
-            };
-        })()"#;
-        if let Ok(v) = cdp.eval(&sid, expr).await {
-            out.push(json!({ "url": truncate(&p.url, 60), "state": v }));
-        }
-    }
-
-    Ok(json!({ "pages": out }))
-}
-
-/// 关闭中文后还原界面。
-///
-/// 为什么光杀守护进程不够：翻译是注入到 DOM 里的，
-/// 文字已经被改成中文了。注入脚本的 `destroy()` 只是断开
-/// MutationObserver，**不会把已经改掉的字改回去**。
-/// 所以必须清标记 + 刷新页面，让浏览器重新拉一份原始 HTML。
-pub async fn restore_zh_ui() -> Result<String, String> {
-    let mut cdp = Cdp::connect().await?;
-    let pages = cdp.list_pages().await?;
-    if pages.is_empty() {
-        return Err("没有找到 Antigravity 页面".into());
-    }
-
-    let mut n = 0;
-    for p in &pages {
-        let sid = match cdp.attach(&p.id).await {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let _ = cdp.send("Page.enable", json!({}), Some(&sid)).await;
-
-        // ---- 关键：先移除所有"导航后自动执行"的注入脚本 ----
-        //
-        // 这一条是必须的，而且顺序不能反。
-        //
-        // `zh on` 时我们用 Page.addScriptToEvaluateOnNewDocument 装了
-        // 一段脚本，它会在**每次页面加载时自动执行**。如果只跑还原脚本
-        // 再 reload，刷新后那段脚本立刻又跑一遍，页面又变回中文 ——
-        // 表现就是"关掉了但界面还是中文"。
-        //
-        // 必须先 Page.removeScriptToEvaluateOnNewDocument 把注册的脚本
-        // 全部摘掉，再刷新，才能真正回到英文。
-        if let Ok(res) = cdp.send("Page.getFrameTree", json!({}), Some(&sid)).await {
-            let _ = res; // 只是确认会话可用
-        }
-
-        // 取当前注册的脚本 id 列表并逐个移除。
-        // CDP 没有"列出所有已注册脚本"的接口，只能靠自己记录 ——
-        // 但 zh on 是另一个进程执行的，这里拿不到它的 id。
-        // 所以换个更可靠的办法：直接清空 by 重新 attach。
-        //
-        // 实测可行的做法：刷新前先 eval 还原脚本，刷新时
-        // addScriptToEvaluateOnNewDocument 的效果**不会**跨进程保留 ——
-        // 但同一个 CDP 连接内会保留。这里我们每次都是新连接，
-        // 所以只要不重新注册就不会执行。
-        let _ = cdp.eval(&sid, STOP_ZH_RESTORE).await;
-
-        // 刷新：新页面不再有注入脚本（本连接没注册过），
-        // 拿到的就是原始英文 HTML。
-        let _ = cdp.reload(&sid).await;
-        n += 1;
-    }
-
-    Ok(format!("已还原并刷新 {} 个页面", n))
-}
-
-/// 页面里注入中文翻译。
-///
-/// 与网页版不同：这里是**桌面版**（Electron 渲染进程），
-/// 页面早已加载完成，所以不需要等 DOMContentLoaded。
-pub async fn apply_zh(dict_json: &str, rules_json: &str, injector_js: &str) -> Result<String, String> {
-    let mut cdp = Cdp::connect().await?;
-    let pages = cdp.list_pages().await?;
-    if pages.is_empty() {
-        return Err("没有找到 Antigravity 页面".into());
-    }
-
-    // 整个注入器 + 词库 + 启动调用，拼成一段自包含表达式。
-    // 和网页版那边一样，必须处理 body 尚未就绪的情况 ——
-    // 桌面版一般已就绪，但切页面时可能碰上中间态。
-    let expr = format!(
+/// 中文注入表达式（注入器 + 词库 + 启动调用，自包含）。
+fn zh_expr() -> Result<String, String> {
+    let (dict, rules, injector) = load_zh_pack().ok_or("内置中文词库解析失败")?;
+    Ok(format!(
         r#"(function(){{
 {injector}
 function __agyZhStart(){{try{{__AGY_ZH_INSTALL__({dict},{rules});}}catch(e){{console.warn('[agy-zh]',e);}}}}
@@ -185,55 +84,262 @@ if(document.body){{__agyZhStart();}}
 else{{document.addEventListener('DOMContentLoaded',__agyZhStart,{{once:true}});}}
 return true;
 }})()"#,
-        injector = injector_js,
-        dict = dict_json,
-        rules = rules_json,
-    );
+        injector = injector,
+        dict = dict,
+        rules = rules,
+    ))
+}
 
-    let mut n = 0;
-    let mut errors = Vec::new();
+/// 巡检所有 Antigravity 页面，按需补注入。
+///
+/// - `want_zh` / `want_ssh`：配置里开着的功能
+/// - `force_ssh_reload`：用户刚打开 SSH 开关时为 true —— 这时允许刷新页面，
+///   不受刷新间隔限制（用户主动操作，预期页面会刷新一下）
+pub async fn ensure_injected(
+    want_zh: bool,
+    want_ssh: bool,
+    force_ssh_reload: bool,
+) -> Result<Report, String> {
+    let devtools_port = crate::cdp::read_debug_port()?;
+    let mut st = state::inject_load();
+    if st.devtools_port != devtools_port {
+        // Antigravity 重启过：旧的刷新记录作废
+        st.reloaded.clear();
+    }
+
+    let result = ensure_injected_inner(want_zh, want_ssh, force_ssh_reload, &mut st).await;
+
+    st.ts = sys::now_secs();
+    st.devtools_port = devtools_port;
+    match &result {
+        Ok(r) => {
+            st.pages = r.pages;
+            st.zh = want_zh && r.pages > 0 && r.zh_ok == r.pages;
+            st.ssh = want_ssh && r.pages > 0 && r.ssh_ok == r.pages;
+            st.ssh_active = want_ssh && r.ssh_active > 0;
+            st.error = r.errors.join("; ");
+        }
+        Err(e) => {
+            st.pages = 0;
+            st.zh = false;
+            st.ssh = false;
+            st.ssh_active = false;
+            st.error = e.clone();
+        }
+    }
+    state::inject_save(&st);
+    result
+}
+
+async fn ensure_injected_inner(
+    want_zh: bool,
+    want_ssh: bool,
+    force_ssh_reload: bool,
+    st: &mut state::InjectState,
+) -> Result<Report, String> {
+    let mut cdp = Cdp::connect().await?;
+    let pages = cdp.list_pages().await?;
+    let mut rep = Report {
+        pages: pages.len(),
+        ..Default::default()
+    };
+    if pages.is_empty() {
+        return Err("没有找到 Antigravity 页面（窗口可能还没打开）".into());
+    }
+
+    let zh_src = if want_zh { Some(zh_expr()?) } else { None };
+
     for p in &pages {
         let sid = match cdp.attach(&p.id).await {
             Ok(s) => s,
             Err(e) => {
-                errors.push(format!("attach: {}", e));
+                rep.errors.push(format!("attach 失败: {}", e));
                 continue;
             }
         };
 
-        // ① 先对**当前文档**执行一次。
-        //    addScriptToEvaluateOnNewDocument 只对之后的导航生效，
-        //    对已经加载完的页面完全没用 —— 这是必须分开做的原因。
-        match cdp.eval(&sid, &expr).await {
-            Ok(v) => {
-                // 注入器返回翻译的节点数；false/null 说明启动函数没跑起来
-                if !v.is_null() && v != serde_json::Value::Bool(false) {
-                    n += 1;
-                } else {
-                    errors.push(format!("{}: 注入返回空", truncate(&p.url, 30)));
-                }
+        let probe = cdp.eval(&sid, PROBE_JS).await.unwrap_or(Value::Null);
+        let has_zh = probe.get("zh").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut has_ssh = probe.get("ssh").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        // ---- SSH 入口 ----
+        if want_ssh && !has_ssh {
+            let may_reload = force_ssh_reload || !st.reloaded.contains_key(&p.id);
+            // ⚠️ 刷新之前就记下，不管结果如何。
+            // 如果只在成功时记录，"刷新了但验证失败"的页面下一轮又会被刷新，
+            // 就是每几秒刷新一次的死循环。
+            if may_reload {
+                st.reloaded.insert(p.id.clone(), sys::now_secs());
+                // 立刻落盘：这一轮如果超时被中断，结尾的保存不会执行，
+                // 下一轮就会把所有窗口再刷新一遍
+                state::inject_save(st);
             }
-            Err(e) => errors.push(format!("{}: {}", truncate(&p.url, 30), e)),
+            match install_ssh_hook(&mut cdp, &sid, may_reload).await {
+                Ok(reloaded) => {
+                    rep.actions.push(format!(
+                        "SSH 钩子已装{}: {}",
+                        if reloaded { "并刷新" } else { "" },
+                        truncate(&p.url, 50)
+                    ));
+                    has_ssh = true;
+                }
+                Err(e) => rep.errors.push(format!("SSH 注入失败: {}", e)),
+            }
+        }
+        if has_ssh {
+            rep.ssh_ok += 1;
+            // 刚刷新过的页面要重新探一次才知道有没有生效
+            let patched = cdp
+                .eval(&sid, PROBE_JS)
+                .await
+                .ok()
+                .and_then(|v| v.get("patched").and_then(|n| n.as_u64()))
+                .unwrap_or(0);
+            if patched > 0 {
+                rep.ssh_active += 1;
+            }
         }
 
-        // ② 同时装成"每次导航后自动注入"，否则刷新/切页面就丢
-        let _ = cdp
-            .send(
-                "Page.addScriptToEvaluateOnNewDocument",
-                json!({ "source": expr }),
-                Some(&sid),
-            )
-            .await;
+        // ---- 中文 ----
+        //
+        // 放在 SSH 后面：SSH 解锁可能刷新了页面，刷新后旧的中文注入就没了，
+        // 这里要重新检查一次。
+        if let Some(src) = &zh_src {
+            let still_has_zh = if want_ssh && !probe.get("ssh").and_then(|v| v.as_bool()).unwrap_or(false) {
+                // 可能刚刷新过，重新探一次
+                cdp.eval(&sid, PROBE_JS)
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("zh").and_then(|b| b.as_bool()))
+                    .unwrap_or(false)
+            } else {
+                has_zh
+            };
+            if still_has_zh {
+                rep.zh_ok += 1;
+            } else {
+                match cdp.eval(&sid, src).await {
+                    Ok(_) => {
+                        rep.zh_ok += 1;
+                        rep.actions.push(format!("已注入中文: {}", truncate(&p.url, 50)));
+                    }
+                    Err(e) => rep.errors.push(format!("中文注入失败: {}", e)),
+                }
+            }
+        }
+
+        cdp.detach(&sid).await;
     }
 
-    if n == 0 {
-        return Err(format!(
-            "全部页面注入失败：{}",
-            if errors.is_empty() { "无页面".into() } else { errors.join("; ") }
-        ));
+    // 关掉的窗口不再记录（防止文件无限增长）。
+    // 注意：没开 SSH 时不能清，否则之后打开 SSH 会把所有窗口当成"新窗口"刷新。
+    if want_ssh {
+        st.reloaded.retain(|id, _| pages.iter().any(|p| &p.id == id));
     }
 
-    Ok(format!("已对 {} 个页面注入中文", n))
+    Ok(rep)
+}
+
+/// 给一个页面装 SSH 钩子。返回是否刷新了页面。
+///
+/// 只对当前文档执行一次钩子是不够的：Antigravity 在页面启动时就请求了
+/// GetMendelFlags，钩子装晚了截不到。所以（允许时）要：
+///   1. addScriptToEvaluateOnNewDocument 登记钩子
+///   2. 刷新页面 —— 新文档在任何页面脚本之前先跑钩子
+///   3. 等页面加载完、确认钩子在，才断开连接
+///      （断开后登记失效，但钩子已经在新页面里运行了，不受影响）
+async fn install_ssh_hook(cdp: &mut Cdp, sid: &str, may_reload: bool) -> Result<bool, String> {
+    // 先对当前文档执行一次（语法错误会在这里直接暴露出来）
+    cdp.eval(sid, SSH_UNLOCK_HOOK).await?;
+    if !may_reload {
+        return Ok(false);
+    }
+
+    let _ = cdp.send("Page.enable", json!({}), Some(sid)).await;
+    cdp.send(
+        "Page.addScriptToEvaluateOnNewDocument",
+        json!({ "source": SSH_UNLOCK_HOOK }),
+        Some(sid),
+    )
+    .await?;
+    cdp.reload(sid).await?;
+
+    // 等新页面加载出来并确认钩子在（最多 15 秒）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        if let Ok(v) = cdp.eval(sid, PROBE_JS).await {
+            let ssh = v.get("ssh").and_then(|b| b.as_bool()).unwrap_or(false);
+            let ready = v.get("ready").and_then(|s| s.as_str()).unwrap_or("");
+            if ssh && ready != "loading" {
+                return Ok(true);
+            }
+        }
+    }
+    Err("刷新后没有检测到钩子".into())
+}
+
+/// 关闭 SSH 入口解锁：让所有页面的钩子放行。
+pub async fn ssh_unlock_off() -> Result<String, String> {
+    let mut cdp = Cdp::connect().await?;
+    let pages = cdp.list_pages().await?;
+    let mut n = 0;
+    for p in &pages {
+        if let Ok(sid) = cdp.attach(&p.id).await {
+            if cdp.eval(&sid, SSH_UNLOCK_OFF).await.is_ok() {
+                n += 1;
+            }
+            cdp.detach(&sid).await;
+        }
+    }
+    let mut st = state::inject_load();
+    st.ssh = false;
+    st.ssh_active = false;
+    state::inject_save(&st);
+    Ok(format!("已关闭 {} 个页面的 SSH 入口钩子（刷新页面后入口消失）", n))
+}
+
+/// 关闭中文后还原界面。
+///
+/// 翻译是直接改 DOM 文字的，注入脚本的 destroy() 只是断开监听，
+/// 不会把字改回去。所以：先尽量还原 + 清标记，再刷新页面。
+/// 刷新后不会再被注入 —— 登记的脚本随上一次 CDP 会话结束已经失效，
+/// 而配置里的 zh_enabled 在调用前已经关掉，巡检也不会再补。
+///
+/// `keep_ssh`：SSH 入口开着时，刷新要带上 SSH 钩子，
+/// 否则关个中文就把 SSH 入口一起弄没了。
+pub async fn restore_zh_ui(keep_ssh: bool) -> Result<String, String> {
+    let mut cdp = Cdp::connect().await?;
+    let pages = cdp.list_pages().await?;
+    if pages.is_empty() {
+        return Err("没有找到 Antigravity 页面".into());
+    }
+
+    let mut st = state::inject_load();
+    let mut n = 0;
+    for p in &pages {
+        let sid = match cdp.attach(&p.id).await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let _ = cdp.send("Page.enable", json!({}), Some(&sid)).await;
+        let _ = cdp.eval(&sid, STOP_ZH_RESTORE).await;
+        if keep_ssh {
+            st.reloaded.insert(p.id.clone(), sys::now_secs());
+            state::inject_save(&st);
+            if install_ssh_hook(&mut cdp, &sid, true).await.is_err() {
+                let _ = cdp.reload(&sid).await;
+            }
+        } else {
+            let _ = cdp.reload(&sid).await;
+        }
+        n += 1;
+        cdp.detach(&sid).await;
+    }
+
+    st.zh = false;
+    state::inject_save(&st);
+    Ok(format!("已还原并刷新 {} 个页面", n))
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -250,35 +356,29 @@ fn truncate(s: &str, n: usize) -> String {
 ///   1. `~/.agyhub/zh-pack/`（用户自己放的，便于更新词库而不换 App）
 ///   2. 编译进二进制的内置副本
 pub fn load_zh_pack() -> Option<(String, String, String)> {
-    // 内置副本
     const BUILTIN_DICT: &str = include_str!("../assets/zh-dict.json");
     const BUILTIN_INJECT: &str = include_str!("../assets/zh-inject.js");
     const BUILTIN_RULES: &str = include_str!("../assets/zh-rules.json");
 
-    let home = std::env::var("HOME").ok()?;
-    let dir = format!("{}/.agyhub/zh-pack", home);
-
+    let dir = sys::data_dir().join("zh-pack");
     let read_or = |name: &str, builtin: &str| -> String {
-        let p = format!("{}/{}", dir, name);
-        std::fs::read_to_string(&p).unwrap_or_else(|_| builtin.to_string())
+        std::fs::read_to_string(dir.join(name)).unwrap_or_else(|_| builtin.to_string())
     };
 
     let dict_raw = read_or("dict.json", BUILTIN_DICT);
     let inject = read_or("inject.js", BUILTIN_INJECT);
     let rules_raw = read_or("rules.json", BUILTIN_RULES);
 
-    // dict.json 里可能同时含 DICT 和 RULES
-    let (dict, rules) = match serde_json::from_str::<serde_json::Value>(&dict_raw) {
-        Ok(v) => {
-            let d = v.get("DICT").cloned().unwrap_or(v.clone());
-            let r = v.get("RULES").cloned().unwrap_or_else(|| json!({}));
-            (d, r)
-        }
-        Err(_) => return None,
-    };
+    // dict.json 里可能同时含 DICT 和 RULES。
+    // 用户自己放的词库坏了时退回内置版，而不是整个功能失效。
+    let parsed = serde_json::from_str::<Value>(&dict_raw)
+        .or_else(|_| serde_json::from_str::<Value>(BUILTIN_DICT))
+        .ok()?;
+    let dict = parsed.get("DICT").cloned().unwrap_or(parsed.clone());
+    let rules = parsed.get("RULES").cloned().unwrap_or_else(|| json!({}));
 
     let rules = if rules.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-        serde_json::from_str::<serde_json::Value>(&rules_raw).unwrap_or_else(|_| json!({}))
+        serde_json::from_str::<Value>(&rules_raw).unwrap_or_else(|_| json!({}))
     } else {
         rules
     };

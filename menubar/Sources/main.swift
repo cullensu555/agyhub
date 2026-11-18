@@ -1,110 +1,190 @@
 // AgyHub —— Antigravity 网页访问网关的菜单栏外壳
 //
 // 分工：
-//   这个文件（Swift）只做 macOS 原生部分：菜单栏图标、菜单、剪贴板、
-//   进程启停、通知。
-//   真正的代理内核是 Resources/agyhub（Rust），它负责服务器、证书、注入。
+//   这个文件（Swift）只做 macOS 原生部分：菜单栏图标、菜单、剪贴板、二维码、提示框。
+//   真正的逻辑都在内核 Resources/agyhub（Rust）里：服务启停、端口、证书、注入。
+//   Swift 只「显示」和「转发用户操作」，事实由 `agyhub status` 的 JSON 提供。
 //
-// 为什么不让 Swift 干所有事：
-//   网卡枚举、上游端口探测、端口占用判断、证书签发，这些在 Rust 里
-//   已经写好并实测过了。Swift 重做一遍就是两份实现，改一处漏一处的经典开局。
-//   所以 Swift 只「显示」，事实由 `agyhub status` 的 JSON 提供。
+// ## 这一版改了什么（对照上一版的实机问题）
+//
+//   1. **所有内核调用都在后台队列**。上一版在主线程同步跑 status（每 3 秒）、
+//      装证书（等用户输密码）、开中文（连 CDP），任何一个卡住整个菜单就卡死。
+//   2. **服务进程由内核管理**（start-web / stop-web …）。上一版 Swift 自己 fork、
+//      自己按 pid kill，状态一误判就重复拉起进程，或者杀不掉。
+//   3. **守护不再弹窗**。上一版守护逻辑会每 20 秒弹一次「选择开发机」或
+//      「SSH 网页版启动失败」，用户取消也没用。现在失败原因显示在菜单里，
+//      并按 5s → 10s → … → 2min 退避重试。
+//   4. **「停止」真的会停**。上一版「停止服务」不改配置，守护 3 秒后又拉起来了。
+//      现在每个服务一个开关，关掉就是关掉。
+//   5. 中文界面 / 桌面版 SSH 入口有了真正的巡检（ensure-inject），
+//      Antigravity 重启或刷新后自动恢复。
 
 import Cocoa
-import SwiftUI
-import Sparkle
-import UserNotifications
+import CoreImage
 import ServiceManagement
+import Sparkle
 
-// MARK: - 状态模型
+// MARK: - 状态模型（宽松解码：缺字段用默认值，内核加减字段都不会让界面掉线）
 
-/// 单个服务的状态。
+private extension KeyedDecodingContainer {
+    func v<T: Decodable>(_ key: Key, _ def: T) -> T {
+        (try? decodeIfPresent(T.self, forKey: key)) ?? def
+    }
+}
+
 struct ServiceStatus: Decodable {
-    var enabled: Bool
-    var running: Bool
-    var port: Int
-    var preferredPort: Int
-    var pid: Int
-    var url: String
-    /// 仅 SSH 网页版有：转发到哪台开发机
-    var target: String?
+    var enabled = false
+    var running = false
+    var starting = false
+    var port = 0
+    var pid = 0
+    var url = ""
+    var target = ""
+    var lastError = ""
+    var detail = ""
 
-    enum CodingKeys: String, CodingKey {
-        case enabled, running, port, pid, url, target
-        case preferredPort = "preferred_port"
+    enum K: String, CodingKey {
+        case enabled, running, starting, port, pid, url, target, detail
+        case lastError = "last_error"
     }
 
-    /// offline 兜底
-    static func stub() -> ServiceStatus {
-        ServiceStatus(
-            enabled: true, running: false, port: 0,
-            preferredPort: 0, pid: 0, url: "", target: nil
-        )
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        enabled = c.v(.enabled, false)
+        running = c.v(.running, false)
+        starting = c.v(.starting, false)
+        port = c.v(.port, 0)
+        pid = c.v(.pid, 0)
+        url = c.v(.url, "")
+        target = c.v(.target, "")
+        lastError = c.v(.lastError, "")
+        detail = c.v(.detail, "")
     }
 }
 
-/// 中文语言包状态。
-struct ZhStatus: Decodable {
-    var enabled: Bool
-    var running: Bool
-    var pid: Int
-}
-
-/// `agyhub status` 的输出。
 struct HubStatus: Decodable {
-    var version: String
-    var running: Bool
-    var port: Int
-    var upstreamOk: Bool
-    var upstreamPort: Int
-    var lanIp: String
-    var token: String
-    var url: String
-    var caTrusted: Bool
-    var caFingerprint: String
-    var pid: Int
-    var web: ServiceStatus
-    var ssh: ServiceStatus
-    var sshWeb: ServiceStatus
-    var bothOn: Bool
-    var tokenPersisted: Bool
-    var zh: ZhStatus
+    var version = "-"
+    var online = false
+    var upstreamOk = false
+    var lanIp = "127.0.0.1"
+    var token = ""
+    var caTrusted = false
+    var agInstalled = true
+    var agRunning = true
+    var fwEnabled = false
+    var fwBlocked = false
+    var web = ServiceStatus()
+    var ssh = ServiceStatus()
+    var sshWeb = ServiceStatus()
+    var zh = ServiceStatus()
 
-    enum CodingKeys: String, CodingKey {
-        case version, running, port, token, url, pid, web, ssh
+    enum K: String, CodingKey {
+        case version, token, web, ssh, zh, antigravity, firewall
         case upstreamOk = "upstream_ok"
-        case upstreamPort = "upstream_port"
         case lanIp = "lan_ip"
         case caTrusted = "ca_trusted"
-        case caFingerprint = "ca_fingerprint"
-        case bothOn = "both_on"
-        case tokenPersisted = "token_persisted"
         case sshWeb = "ssh_web"
-        case zh
     }
 
-    /// 兜底：内核没跑或 status 失败时用，避免界面全是 nil。
-    static func offline(port: Int) -> HubStatus {
-        let empty = ServiceStatus.stub()
-        return HubStatus(
-            version: "-", running: false, port: port,
-            upstreamOk: false, upstreamPort: 0,
-            lanIp: "127.0.0.1", token: "", url: "",
-            caTrusted: false, caFingerprint: "", pid: 0,
-            web: empty, ssh: empty, sshWeb: empty,
-            bothOn: false, tokenPersisted: false,
-            zh: ZhStatus(enabled: false, running: false, pid: 0)
-        )
+    struct Ag: Decodable {
+        var installed = true
+        var running = true
+        enum K: String, CodingKey { case installed, running }
+        init() {}
+        init(from d: Decoder) throws {
+            let c = try d.container(keyedBy: K.self)
+            installed = c.v(.installed, true)
+            running = c.v(.running, true)
+        }
     }
+
+    struct Fw: Decodable {
+        var enabled = false
+        var blocked = false
+        enum K: String, CodingKey { case enabled, blocked }
+        init() {}
+        init(from d: Decoder) throws {
+            let c = try d.container(keyedBy: K.self)
+            enabled = c.v(.enabled, false)
+            blocked = c.v(.blocked, false)
+        }
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        version = c.v(.version, "-")
+        online = true
+        upstreamOk = c.v(.upstreamOk, false)
+        lanIp = c.v(.lanIp, "127.0.0.1")
+        token = c.v(.token, "")
+        caTrusted = c.v(.caTrusted, false)
+        let ag = c.v(.antigravity, Ag())
+        agInstalled = ag.installed
+        agRunning = ag.running
+        let fw = c.v(.firewall, Fw())
+        fwEnabled = fw.enabled
+        fwBlocked = fw.blocked
+        web = c.v(.web, ServiceStatus())
+        ssh = c.v(.ssh, ServiceStatus())
+        sshWeb = c.v(.sshWeb, ServiceStatus())
+        zh = c.v(.zh, ServiceStatus())
+    }
+}
+
+// MARK: - 日志
+
+let logsDir: URL = {
+    let d = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("Logs")
+    try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+    return d
+}()
+
+private let logLock = NSLock()
+
+/// 写诊断日志（GUI 进程的 stdout 会被系统吞掉，只能靠文件）。
+func dlog(_ msg: String) {
+    logLock.lock()
+    defer { logLock.unlock() }
+    let url = logsDir.appendingPathComponent("AgyHub-debug.log")
+    // 超过 2MB 滚动一份，避免无限增长
+    if let attr = try? FileManager.default.attributesOfItem(atPath: url.path),
+       let size = attr[.size] as? NSNumber, size.intValue > 2_000_000 {
+        let old = logsDir.appendingPathComponent("AgyHub-debug.log.1")
+        try? FileManager.default.removeItem(at: old)
+        try? FileManager.default.moveItem(at: url, to: old)
+    }
+    let line = "\(ISO8601DateFormatter().string(from: Date())) \(msg)\n"
+    if let h = try? FileHandle(forWritingTo: url) {
+        h.seekToEndOfFile()
+        h.write(Data(line.utf8))
+        try? h.close()
+    } else {
+        try? line.write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
+/// 去掉日志里的访问口令（用户会把日志发给别人看）。
+func redact(_ s: String) -> String {
+    var out = s
+    for pattern in ["([?&]t=)[0-9a-fA-F]{8,}", "(agygate=)[0-9a-fA-F]{8,}", "(\"token\":\")[0-9a-fA-F]{8,}"] {
+        if let re = try? NSRegularExpression(pattern: pattern) {
+            out = re.stringByReplacingMatches(
+                in: out, range: NSRange(out.startIndex..., in: out), withTemplate: "$1<已隐藏>")
+        }
+    }
+    return out
 }
 
 // MARK: - 内核调用
 
-/// 找到 Rust 内核。
+/// 找到 Rust 内核（只认 App 包内的，和开发时 cargo 的产物）。
 func corePath() -> String? {
-    let fm = FileManager.default
     var candidates: [String] = []
-
     if let res = Bundle.main.resourcePath {
         candidates.append(res + "/agyhub")
     }
@@ -113,114 +193,204 @@ func corePath() -> String? {
         candidates.append(dir.path + "/agyhub-rs/target/release/agyhub")
         dir = dir.deletingLastPathComponent()
     }
-    // ⚠️ 不写死任何绝对路径。
-    //
-    // 上面两条已经覆盖了所有正当场景：
-    //   · 正式分发：内核在 Bundle.main.resourcePath 里（打包时拷进去）
-    //   · 本地开发：从 build/ 往上能找到 agyhub-rs/target/release/
-    //
-    // 早先这里还有一条写死的 `<开发机上的个人目录>`，
-    // 那是开发机的个人路径 —— 分包出去毫无意义，还泄露目录结构。已去掉。
-
-    for c in candidates where fm.isExecutableFile(atPath: c) {
-        return c
-    }
-    return nil
+    return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
 }
 
-/// 同步跑一次内核命令，返回 stdout 数据。
+/// 跑一次内核命令，返回 stdout。**不要在主线程调用。**
 ///
-/// ⚠️ 为什么用**临时文件**而不是 Pipe：
-///   早先的实现用 `Pipe()` + `readDataToEndOfFile()`，在 GUI 进程里
-///   偶尔会拿不到任何数据（菜单显示 `v-`、状态永远"未启动"）。
-///   GUI 进程没有终端，子进程的管道缓冲区行为和终端里跑不同，
-///   加上 readDataToEndOfFile 与 waitUntilExit 的调用顺序问题，
-///   很容易死锁或读到空。
-///   改成重定向到临时文件、跑完再读，稳定可靠。
-func runCore(_ args: [String]) -> Data? {
+/// 用临时文件接 stdout 而不是 Pipe：GUI 进程里 Pipe + readDataToEndOfFile
+/// 与 waitUntilExit 的顺序问题曾导致读到空数据。
+/// 带超时：内核任何一步卡住，都不能把 App 的后台队列永久堵死。
+func runCore(_ args: [String], timeout: TimeInterval = 20) -> Data? {
     guard let core = corePath() else { return nil }
     let tmp = FileManager.default.temporaryDirectory
-        .appendingPathComponent("agyhub-out-\(UUID().uuidString).json")
-
+        .appendingPathComponent("agyhub-\(UUID().uuidString).out")
     FileManager.default.createFile(atPath: tmp.path, contents: nil)
+    defer { try? FileManager.default.removeItem(at: tmp) }
     guard let fh = FileHandle(forWritingAtPath: tmp.path) else { return nil }
 
     let p = Process()
     p.executableURL = URL(fileURLWithPath: core)
     p.arguments = args
     p.standardOutput = fh
-    // stderr 必须重定向到别处，否则会阻塞（管道满了没人读）
-    p.standardError = FileHandle(forWritingAtPath: "/dev/null")
+    p.standardError = FileHandle.nullDevice
+    p.standardInput = FileHandle.nullDevice
 
+    let done = DispatchSemaphore(value: 0)
+    p.terminationHandler = { _ in done.signal() }
     do {
         try p.run()
     } catch {
         try? fh.close()
-        try? FileManager.default.removeItem(at: tmp)
+        dlog("runCore \(args.first ?? ""): 启动失败 \(error)")
         return nil
     }
-    p.waitUntilExit()
+    if done.wait(timeout: .now() + timeout) == .timedOut {
+        dlog("runCore \(args.joined(separator: " ")): 超时 \(Int(timeout))s，已终止")
+        p.terminate()
+        _ = done.wait(timeout: .now() + 2)
+        try? fh.close()
+        return nil
+    }
     try? fh.close()
-
-    let data = try? Data(contentsOf: tmp)
-    try? FileManager.default.removeItem(at: tmp)
-    return data
+    return try? Data(contentsOf: tmp)
 }
 
-/// 写诊断日志。
-///
-/// 为什么需要：GUI 进程的 stdout 会被系统吞掉，出了问题看不到任何线索。
-/// 菜单显示 `v-`（读不到状态）和「点启动没反应」都没有报错弹窗，
-/// 只能靠日志。
-func dlog(_ msg: String) {
-    let dir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("Logs")
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    let url = dir.appendingPathComponent("AgyHub-debug.log")
-    let line = "\(ISO8601DateFormatter().string(from: Date())) \(msg)\n"
-    if let h = try? FileHandle(forWritingTo: url) {
-        h.seekToEndOfFile()
-        h.write(line.data(using: .utf8)!)
-        h.closeFile()
-    } else {
-        try? line.write(to: url, atomically: true, encoding: .utf8)
-    }
+func runCoreJSON(_ args: [String], timeout: TimeInterval = 20) -> [String: Any]? {
+    guard let d = runCore(args, timeout: timeout) else { return nil }
+    // 取最后一个非空行：防御性处理，避免前面混入别的输出
+    let text = String(decoding: d, as: UTF8.self)
+    let line = text.split(separator: "\n").last(where: { $0.hasPrefix("{") }).map(String.init) ?? text
+    return (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any]
 }
 
-func fetchStatus(port: Int) -> HubStatus? {
-    guard let data = runCore(["--port", String(port), "status"]) else {
-        dlog("fetchStatus: runCore 返回 nil（corePath=\(corePath() ?? "nil")）")
-        return nil
+/// 跑内核命令并拿到全部输出文本（stdout + stderr），用于装证书、自检。
+func runCoreText(_ args: [String], timeout: TimeInterval) -> (ok: Bool, text: String) {
+    guard let core = corePath() else { return (false, "找不到内核") }
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("agyhub-\(UUID().uuidString).txt")
+    FileManager.default.createFile(atPath: tmp.path, contents: nil)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    guard let fh = FileHandle(forWritingAtPath: tmp.path) else { return (false, "") }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: core)
+    p.arguments = args
+    p.standardOutput = fh
+    p.standardError = fh
+    p.standardInput = FileHandle.nullDevice
+    let done = DispatchSemaphore(value: 0)
+    p.terminationHandler = { _ in done.signal() }
+    do { try p.run() } catch {
+        try? fh.close()
+        return (false, "\(error)")
     }
-    do {
-        return try JSONDecoder().decode(HubStatus.self, from: data)
-    } catch {
-        let raw = String(data: data, encoding: .utf8) ?? "<非文本>"
-        dlog("fetchStatus: 解码失败 \(error)；原始输出前 200 字：\(raw.prefix(200))")
-        return nil
+    let timedOut = done.wait(timeout: .now() + timeout) == .timedOut
+    if timedOut {
+        p.terminate()
+        _ = done.wait(timeout: .now() + 2)
     }
+    try? fh.close()
+    let text = (try? String(contentsOf: tmp, encoding: .utf8)) ?? ""
+    return (!timedOut && p.terminationStatus == 0, text)
+}
+
+// MARK: - 二维码
+
+func qrImage(_ text: String, size: CGFloat = 240) -> NSImage? {
+    guard let f = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+    f.setValue(Data(text.utf8), forKey: "inputMessage")
+    f.setValue("M", forKey: "inputCorrectionLevel")
+    guard let out = f.outputImage else { return nil }
+    let scale = size / out.extent.width
+    let img = out.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+    let rep = NSCIImageRep(ciImage: img)
+    let ns = NSImage(size: rep.size)
+    ns.addRepresentation(rep)
+    return ns
 }
 
 // MARK: - 应用主体
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
-    var status: HubStatus = .offline(port: 8898)
-    var coreProcess: Process?
-    var refreshTimer: Timer?
+    var status = HubStatus()
     var updaterController: SPUStandardUpdaterController?
-    var port = 8898
 
-    /// 每个服务的最近一次"自动重启"时间，用于退避。
-    /// 防止服务起不来时每 3 秒重启一次，把系统拖垮。
-    var lastAutoStart: [String: Date] = [:]
-    /// 自动重启的最小间隔（秒）
-    let autoStartCooldown: TimeInterval = 20
+    /// status 轮询（串行，同一时刻只有一个在跑）
+    let pollQueue = DispatchQueue(label: "agyhub.poll")
+    /// 用户操作与守护（串行：启动、停止不会互相打架）
+    let actionQueue = DispatchQueue(label: "agyhub.action")
+    /// 桌面版注入巡检（可能要连 CDP，单独一条队列，不拖慢 status）
+    let injectQueue = DispatchQueue(label: "agyhub.inject")
+    /// 装证书（要等用户在系统弹窗里输密码，可能好几分钟，不能堵住其它操作）
+    let certQueue = DispatchQueue(label: "agyhub.cert")
 
-    /// 启动时把环境信息写进日志。
+    /// 用户操作计数：每次操作开始/结束都 +1。
+    /// 一次 status 轮询跨过了用户操作的话，结果可能是"新旧混合"的
+    /// （配置还没写进去、进程已经停了），这种结果直接丢弃重新查，
+    /// 否则守护会把用户刚关掉的服务又拉起来。
+    var actionEpoch = 0
+    /// 用户最近一次手动开关某个服务的时间：之后几秒内守护不碰它
+    var userTouched: [String: Date] = [:]
+    /// 本实例是重复启动的（马上会退出）：退出时不能去停服务
+    var isDuplicate = false
+
+    var polling = false
+    var injecting = false
+    var busy: [String: String] = [:]          // 服务 → 正在进行的操作（菜单里显示）
+    var retryAt: [String: Date] = [:]          // 守护退避：下次允许自动重启的时间
+    var retryCount: [String: Int] = [:]
+    var initialStartDone = false
+    var lastInjectAt = Date.distantPast
+    var flashUntil = Date.distantPast
+    var timer: Timer?
+
+    let firstRunKey = "AGYHub.onboarded"
+
+    // MARK: 启动
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        if quitIfDuplicate() { return }
+
+        setupStatusItem()
+        logEnvironment()
+
+        if corePath() == nil {
+            dlog("⚠️ 找不到内核")
+            alert("App 已损坏", "包内缺少内核文件（Contents/Resources/agyhub）。请重新下载安装。")
+        }
+
+        // 从 DMG 里直接运行 / 被系统隔离到临时目录运行：登录项、自动更新都会出问题
+        warnIfNotInApplications()
+
+        refresh { [weak self] in
+            self?.initialStart()
+            self?.firstRunIfNeeded()
+        }
+
+        enableLaunchAtLoginIfFirstRun()
+
+        timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
+
+        if let feed = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String, !feed.isEmpty,
+           let key = Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String, !key.isEmpty {
+            updaterController = SPUStandardUpdaterController(
+                startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+        }
+    }
+
+    /// 退出 App 时停掉服务。
     ///
-    /// 用户报问题时，这几行能省掉一半来回问答：
-    /// 版本、系统、内核路径、配置状态。
+    /// 上一版退出 App 后服务还在后台跑：菜单栏图标没了，局域网里却还开着
+    /// 一个能操作 AI agent 的入口，用户完全看不到。
+    func applicationWillTerminate(_ notification: Notification) {
+        // 重复启动的那个实例退出时，服务是另一个实例在管，不能停
+        guard !isDuplicate else { return }
+        dlog("退出 App，停止服务")
+        _ = runCore(["stop"], timeout: 8)
+    }
+
+    /// 同时只允许一个 AgyHub 在跑（比如 /Applications 和下载目录里各开了一个）。
+    func quitIfDuplicate() -> Bool {
+        guard let id = Bundle.main.bundleIdentifier else { return false }
+        let me = ProcessInfo.processInfo.processIdentifier
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: id)
+            .filter { $0.processIdentifier != me }
+        if !others.isEmpty {
+            isDuplicate = true
+            dlog("已有另一个 AgyHub 在运行（pid \(others[0].processIdentifier)），本实例退出")
+            let a = NSAlert()
+            a.messageText = "AgyHub 已经在运行"
+            a.informativeText = "看屏幕右上角菜单栏里的 AgyHub 图标。"
+            a.runModal()
+            NSApp.terminate(nil)
+            return true
+        }
+        return false
+    }
+
     func logEnvironment() {
         let ver = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
         dlog("=== AgyHub \(ver) 启动 ===")
@@ -232,540 +402,576 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         #endif
         dlog("App: \(Bundle.main.bundlePath)")
         dlog("内核: \(corePath() ?? "未找到")")
-        dlog("数据目录: \(NSHomeDirectory())/.agyhub")
-        dlog("初始状态: web(en=\(status.web.enabled) run=\(status.web.running)) "
-           + "ssh(en=\(status.ssh.enabled)) "
-           + "sshWeb(en=\(status.sshWeb.enabled) target=\(status.sshWeb.target ?? "无")) "
-           + "zh(en=\(status.zh.enabled)) ca=\(status.caTrusted)")
     }
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        setupStatusItem()
-        refresh()
-
-        // ---- 需求：打开 App 就自动把服务拉起来，不用用户手动点 ----
-        //
-        // 判断条件用 status.web.running（而不是「配置里 enabled」）：
-        // 用户可能手动停过服务，那种情况不该强行拉起。
-        // 只在"确实没在跑"且"配置里是启用状态"时才自动启动。
-        logEnvironment()
-        ensureServicesRunning()
-
-        // ---- 自动安装根证书（用户实测反馈：不该让用户手动点）----
-        //
-        // 为什么必须自动：
-        //   不装根证书，手机打开页面会一直显示"不安全"。
-        //   用户不知道"安装证书"是什么意思，也不知道为什么要装 ——
-        //   这是个纯粹的技术细节，不该丢给用户处理。
-        //
-        // 做法：延迟 1.5 秒（等菜单栏图标先出来，避免启动时抢焦点），
-        // 然后调内核 trust-cert。已装过的话内核会直接返回 true，很快。
-        //
-        // 注意：`security add-trusted-cert` 会弹系统密码框，这是 macOS 的
-        // 强制行为，无法绕过。但只在首次需要，之后静默通过。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            self?.autoInstallCertIfNeeded()
-        }
-
-        // ---- 需求：登录时自动启动默认勾选 ----
-        // 第一次运行时自动注册登录项，尽量少让用户手动操作。
-        // 用 UserDefaults 记住"已经处理过一次"，避免用户主动取消后又被自动打开。
-        enableLaunchAtLoginIfFirstRun()
-
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
-            self?.refresh()
-            self?.guardServices()
-        }
-
-        if let feed = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String,
-           !feed.isEmpty,
-           let key = Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String,
-           !key.isEmpty {
-            updaterController = SPUStandardUpdaterController(
-                startingUpdater: true,
-                updaterDelegate: nil,
-                userDriverDelegate: nil
-            )
+    func warnIfNotInApplications() {
+        let path = Bundle.main.bundlePath
+        let fromDMG = path.hasPrefix("/Volumes/")
+        let translocated = path.contains("/AppTranslocation/")
+        guard fromDMG || translocated else { return }
+        dlog("运行位置异常: \(path)")
+        let a = NSAlert()
+        a.messageText = "请先把 AgyHub 拖进「应用程序」文件夹"
+        a.informativeText = fromDMG
+            ? "现在是直接从安装盘里运行的。推出安装盘后 App 就会消失，「登录时自动启动」和自动更新也不会生效。\n\n把 AgyHub 拖到「应用程序」，再从那里打开。"
+            : "macOS 把这个 App 放在临时隔离目录里运行，「登录时自动启动」和自动更新都不会生效。\n\n请把 AgyHub 拖到「应用程序」文件夹后再打开；如果仍然提示，在终端执行：\nxattr -dr com.apple.quarantine /Applications/AgyHub.app"
+        a.addButton(withTitle: "打开「应用程序」文件夹并退出")
+        a.addButton(withTitle: "仍然继续")
+        if a.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications"))
+            NSApp.terminate(nil)
         }
     }
 
-    // MARK: 图标
+    /// 打开 App 时把配置里开着的服务拉起来。
+    ///
+    /// 无条件调用 start-web（而不是"没在跑才调"）：内核会判断在跑的是不是
+    /// 当前版本，旧版本留下的进程会被替换 —— 否则升级后跑的还是旧代码。
+    func initialStart() {
+        initialStartDone = true
+        if status.web.enabled {
+            startService("web")
+        }
+        if status.sshWeb.enabled && !status.sshWeb.target.isEmpty {
+            startService("ssh_web")
+        }
+        maybeEnsureInject(force: true)
+    }
+
+    // MARK: 首次运行引导
+
+    func firstRunIfNeeded() {
+        let d = UserDefaults.standard
+        guard !d.bool(forKey: firstRunKey) else { return }
+        d.set(true, forKey: firstRunKey)
+
+        // 老用户升级上来（证书早就装好了）：不打扰
+        if status.caTrusted && d.bool(forKey: "AGYHub.didSetupLaunchAtLogin") {
+            return
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "AgyHub 已经在运行"
+        a.informativeText = """
+        它在屏幕右上角的菜单栏里（不在 Dock）。
+        作用：让同一个 Wi-Fi 下的手机打开这台 Mac 上的 Antigravity。
+
+        \(status.caTrusted ? "" : "还差一步：安装本地证书，浏览器才不会提示「不安全」。macOS 会要求输入一次电脑登录密码。\n")
+        """
+        if status.caTrusted {
+            a.addButton(withTitle: "用手机扫码打开")
+            a.addButton(withTitle: "知道了")
+            if a.runModal() == .alertFirstButtonReturn {
+                showQR(kind: "web")
+            }
+            return
+        }
+        a.addButton(withTitle: "安装证书")
+        a.addButton(withTitle: "以后再说")
+        if a.runModal() == .alertFirstButtonReturn {
+            installCert(thenShowQR: true)
+        }
+    }
+
+    // MARK: 菜单栏图标
 
     func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             button.image = menuBarImage()
             button.imageScaling = .scaleProportionallyDown
+            button.imagePosition = .imageLeading
         }
-        rebuildMenu()
+        let menu = NSMenu()
+        menu.delegate = self
+        menu.autoenablesItems = false
+        statusItem.menu = menu
     }
 
-    /// 菜单栏图标。
-    ///
-    /// ⚠️ 不能设 isTemplate = true：模板图会被系统强制渲染成单色剪影，
-    /// 摆在 Docker / iStat 那类彩色图标中间格格不入。
+    /// 菜单栏图标。不设 isTemplate：模板图会被渲染成单色剪影。
     func menuBarImage() -> NSImage? {
-        let pt: CGFloat = 18
         if let img = Bundle.main.image(forResource: "MenuIcon") {
             img.isTemplate = false
-            img.size = NSSize(width: pt, height: pt)
+            img.size = NSSize(width: 18, height: 18)
             return img
         }
-        let sym = NSImage(
-            systemSymbolName: "antenna.radiowaves.left.and.right",
-            accessibilityDescription: "AgyHub"
-        )
+        let sym = NSImage(systemSymbolName: "antenna.radiowaves.left.and.right", accessibilityDescription: "AgyHub")
         sym?.isTemplate = true
         return sym
     }
 
     func updateIcon() {
         guard let button = statusItem.button else { return }
-        button.image = menuBarImage()
-        button.toolTip = status.running ? "AgyHub · 正在运行" : "AgyHub · 未启动"
+        let anyRunning = status.web.running || status.sshWeb.running
+        // 服务没在跑时图标变灰：一眼就能看出"现在手机打不开"
+        button.appearsDisabled = !anyRunning
+        if Date() >= flashUntil {
+            button.title = ""
+        }
+        var tip = anyRunning ? "AgyHub · 运行中" : "AgyHub · 未运行"
+        if !status.agRunning { tip += "（Antigravity 没有打开）" }
+        button.toolTip = tip
     }
 
-    /// 打开 App 时自动拉起服务。
-    ///
-    /// 为什么不做成"无条件启动"：
-    ///   用户可能刚点了「停止服务」，切走再切回来 App 又被拉起会很烦。
-    ///   这里只在「配置里是开启状态」且「实际没在跑」时启动。
-    func ensureServicesRunning() {
-        let needWeb = status.web.enabled && !status.web.running
-        let needSSHWeb = status.sshWeb.enabled && !status.sshWeb.running
-        let needSSH = status.ssh.enabled && status.ssh.pid == 0
+    /// 在图标旁边闪一下文字（代替系统通知：不需要通知权限）。
+    func flash(_ text: String) {
+        guard let button = statusItem.button else { return }
+        button.title = " " + text
+        flashUntil = Date().addingTimeInterval(1.8)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.9) { [weak self] in
+            guard let self, Date() >= self.flashUntil else { return }
+            self.statusItem.button?.title = ""
+        }
+    }
 
-        guard needWeb || needSSHWeb || needSSH else {
-            dlog("ensureServicesRunning: 跳过 | web(en=\(status.web.enabled) run=\(status.web.running)) sshWeb(en=\(status.sshWeb.enabled) run=\(status.sshWeb.running) port=\(status.sshWeb.port)) ssh(en=\(status.ssh.enabled) pid=\(status.ssh.pid))")
+    // MARK: 状态刷新与守护
+
+    func refresh(_ then: (() -> Void)? = nil) {
+        if polling {
+            if let then { DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.refresh(then) } }
             return
         }
-        dlog("ensureServicesRunning: web=\(needWeb) sshWeb=\(needSSHWeb) ssh=\(needSSH)")
-        startAll()
+        polling = true
+        let epoch = actionEpoch
+        pollQueue.async { [weak self] in
+            var s: HubStatus? = nil
+            var raw = ""
+            if let d = runCore(["status"], timeout: 15) {
+                do {
+                    s = try JSONDecoder().decode(HubStatus.self, from: d)
+                } catch {
+                    raw = String(decoding: d.prefix(200), as: UTF8.self)
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.polling = false
+                if epoch != self.actionEpoch {
+                    // 查询期间用户做了操作：结果可能新旧混合，重新查
+                    self.refresh(then)
+                    return
+                }
+                self.apply(s, raw: raw)
+                then?()
+            }
+        }
     }
 
-    /// 守护各个服务：掉线了就自动拉起来。
-    ///
-    /// 为什么需要这个（用户的原话：「关掉你又没重启，怎么会继续生效？」）：
-    ///   之前只在 App 启动时跑一次 ensureServicesRunning，
-    ///   之后服务挂了就再也不管了 —— 表现就是"明明说会自动启动，
-    ///   结果过一会儿又打不开了"。
-    ///   现在每 3 秒检查一次，发现掉线就重启。
-    ///
-    /// 退避（cooldown）是必须的：
-    ///   如果某个服务因为配置错误/端口永久冲突起不来，
-    ///   没有退避就会每 3 秒起一次，日志爆炸、CPU 占满。
+    func apply(_ s: HubStatus?, raw: String) {
+        let prev = status
+        if let s {
+            status = s
+        } else {
+            if prev.online {
+                dlog("⚠️ 读不到内核状态（\(raw.isEmpty ? "无输出" : redact(raw))）")
+            }
+            var off = HubStatus()
+            off.web.enabled = prev.web.enabled
+            status = off
+        }
+        logTransitions(prev, status)
+        updateIcon()
+        guardServices()
+        maybeEnsureInject(force: false)
+    }
+
+    /// 只在状态跳变时记日志（每 3 秒记一次的话，有用的信息会被冲掉）。
+    func logTransitions(_ a: HubStatus, _ b: HubStatus) {
+        if a.web.running != b.web.running {
+            dlog("状态变化: 网页版 → \(b.web.running ? "运行" : "停止") port=\(b.web.port) \(b.web.lastError)")
+        }
+        if a.sshWeb.running != b.sshWeb.running {
+            dlog("状态变化: SSH网页版 → \(b.sshWeb.running ? "运行" : "停止") \(b.sshWeb.lastError)")
+        }
+        if a.caTrusted != b.caTrusted {
+            dlog("状态变化: 根证书 → \(b.caTrusted ? "已信任" : "未信任")")
+        }
+        if a.agRunning != b.agRunning {
+            dlog("状态变化: Antigravity → \(b.agRunning ? "运行" : "未运行")")
+        }
+        if a.fwBlocked != b.fwBlocked && b.fwBlocked {
+            dlog("⚠️ 防火墙拦截了 agyhub 的入站连接")
+        }
+    }
+
+    /// 服务掉线自动拉起（带退避，失败不弹窗）。
     func guardServices() {
+        guard initialStartDone, status.online else { return }
+        let now = Date()
+        for key in ["web", "ssh_web"] {
+            let svc = key == "web" ? status.web : status.sshWeb
+            if svc.running || !svc.enabled {
+                retryCount[key] = 0
+                continue
+            }
+            if svc.starting || busy[key] != nil { continue }
+            if let t = userTouched[key], now.timeIntervalSince(t) < 8 { continue }
+            if key == "ssh_web" && svc.target.isEmpty { continue }
+            if let t = retryAt[key], now < t { continue }
+
+            let n = retryCount[key, default: 0]
+            let delays: [TimeInterval] = key == "web" ? [5, 10, 20, 40, 60] : [10, 20, 40, 80, 120]
+            retryAt[key] = now.addingTimeInterval(delays[min(n, delays.count - 1)])
+            retryCount[key] = n + 1
+            dlog("守护: \(key) 未运行，自动启动（第 \(n + 1) 次）")
+            startService(key)
+        }
+    }
+
+    /// 桌面版中文 / SSH 入口巡检：Antigravity 重启或刷新后自动补注入。
+    func maybeEnsureInject(force: Bool) {
+        guard status.zh.enabled || status.ssh.enabled else { return }
+        // 用户刚点了开关、那条命令还在跑：别同时再巡检一次（会重复刷新页面）
+        guard status.agRunning, !injecting, busy["ssh"] == nil, busy["zh"] == nil else { return }
+        let interval: TimeInterval = (status.zh.running || !status.zh.enabled) && (status.ssh.running || !status.ssh.enabled) ? 6 : 3
+        guard force || Date().timeIntervalSince(lastInjectAt) >= interval else { return }
+        injecting = true
+        lastInjectAt = Date()
+        injectQueue.async { [weak self] in
+            let r = runCoreJSON(["ensure-inject"], timeout: 60)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.injecting = false
+                if let acts = r?["actions"] as? [String], !acts.isEmpty {
+                    dlog("注入巡检: \(acts.joined(separator: "; "))")
+                }
+                if let ok = r?["ok"] as? Bool, !ok, let e = r?["error"] as? String, !e.isEmpty {
+                    dlog("注入巡检失败: \(e)")
+                }
+            }
+        }
+    }
+
+    // MARK: 服务操作（都在 actionQueue 上跑）
+
+    func startService(_ key: String) {
+        var args: [String]
+        if key == "web" {
+            args = ["start-web"]
+        } else {
+            guard !status.sshWeb.target.isEmpty else { return }
+            args = ["start-ssh-web", "--target", status.sshWeb.target]
+        }
+        perform(key, "正在启动…", args, timeout: 30) { [weak self] obj in
+            if let ok = obj?["ok"] as? Bool, !ok {
+                dlog("启动 \(key) 失败: \(obj?["error"] as? String ?? "未知")")
+            }
+            self?.refresh()
+        }
+    }
+
+    func stopService(_ key: String, then: (() -> Void)? = nil) {
+        perform(key, "正在停止…", [key == "web" ? "stop-web" : "stop-ssh-web"], timeout: 15) { [weak self] _ in
+            self?.refresh(then)
+        }
+    }
+
+    /// 在后台跑一个内核命令，期间菜单显示"进行中"。
+    func perform(_ key: String, _ label: String, _ args: [String], timeout: TimeInterval,
+                 done: @escaping ([String: Any]?) -> Void) {
+        busy[key] = label
+        actionEpoch += 1
+        actionQueue.async { [weak self] in
+            let obj = runCoreJSON(args, timeout: timeout)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.busy[key] = nil
+                self.actionEpoch += 1
+                done(obj)
+            }
+        }
+    }
+
+    // MARK: 菜单（打开时才构建，内容永远是最新状态）
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        buildMenu(menu)
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        refresh()
+    }
+
+    func item(_ title: String, _ action: Selector?, key: String = "", obj: Any? = nil,
+              enabled: Bool = true, indent: Int = 0) -> NSMenuItem {
+        let it = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        it.target = self
+        it.representedObject = obj
+        it.isEnabled = enabled && action != nil
+        it.indentationLevel = indent
+        return it
+    }
+
+    func info(_ title: String, indent: Int = 1) -> NSMenuItem {
+        let it = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        it.isEnabled = false
+        it.indentationLevel = indent
+        return it
+    }
+
+    func buildMenu(_ menu: NSMenu) {
+        let appVer = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        menu.addItem(info("AgyHub \(appVer)", indent: 0))
+
+        if !status.online {
+            menu.addItem(info("⚠︎ 内核没有响应（点「查看日志」）", indent: 0))
+        } else if !status.agInstalled {
+            menu.addItem(info("⚠︎ 这台 Mac 没有安装 Antigravity", indent: 0))
+        } else if !status.agRunning {
+            menu.addItem(info("⚠︎ Antigravity 没有打开（手机上会看到提示页）", indent: 0))
+        }
+        if status.fwBlocked {
+            menu.addItem(item("⚠︎ 防火墙拦截了连接，手机打不开（点击查看）", #selector(showFirewallHelp)))
+        }
+        if status.online && !status.caTrusted {
+            if busy["cert"] != nil {
+                menu.addItem(info("正在安装证书…（请在系统弹窗里输入密码）", indent: 0))
+            } else {
+                menu.addItem(item("⚠︎ 安装根证书（消除「不安全」警告）", #selector(installCertFromMenu)))
+            }
+        }
+
         // ---- 本机网页版 ----
-        //
-        // ⚠️ 这里原来**只守护 ssh_web，漏了 web**。
-        //
-        // 后果就是用户实测到的现象：
-        //   打开 App 时服务起来了，过一会儿（内核崩溃/被系统回收/端口冲突）
-        //   就没了，界面变成"未开启"，必须手动再点一次。
-        //   自动守护本该负责这件事，但它压根没检查 web。
-        checkAndRestart(key: "web", enabled: status.web.enabled, running: status.web.running) { [weak self] in
-            self?.startWebService()
+        menu.addItem(.separator())
+        let web = item("本机网页版（手机访问这台 Mac）", #selector(toggleWeb))
+        web.state = status.web.enabled ? .on : .off
+        menu.addItem(web)
+        if status.web.enabled {
+            addServiceDetail(menu, key: "web", svc: status.web)
         }
 
         // ---- SSH 网页版 ----
-        checkAndRestart(key: "ssh_web", enabled: status.sshWeb.enabled, running: status.sshWeb.running) { [weak self] in
-            self?.startSSHWebService()
-        }
-    }
-
-    /// 只启动本机网页版（不牵扯 SSH）。
-    ///
-    /// 从 `startAll` 里拆出来，是因为守护逻辑需要"只补掉线的那一个"：
-    /// 如果 web 掉了就去调 startAll，会把 SSH 相关也一并重拉，
-    /// 在 SSH 关闭的情况下反而可能弹出不必要的授权框。
-    func startWebService() {
-        guard let core = corePath() else {
-            dlog("startWebService: 找不到内核")
-            return
-        }
-        if let d = runCore(["pick-port", "web"]),
-           let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-           let p = obj["port"] as? Int {
-            port = p
+        menu.addItem(.separator())
+        let sw = item("SSH 网页版（手机访问开发机）", #selector(toggleSSHWeb))
+        sw.state = status.sshWeb.enabled ? .on : .off
+        menu.addItem(sw)
+        if status.sshWeb.enabled {
+            let t = status.sshWeb.target.isEmpty ? "未选择（点击选择）" : status.sshWeb.target
+            menu.addItem(item("开发机：\(t)", #selector(chooseSSHTarget), indent: 1))
+            addServiceDetail(menu, key: "ssh_web", svc: status.sshWeb)
         }
 
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: core)
-        p.arguments = ["--port", String(port)]
-
-        let logPath = logURL().path
-        FileManager.default.createFile(atPath: logPath, contents: nil)
-        if let fh = FileHandle(forWritingAtPath: logPath) {
-            fh.seekToEndOfFile()
-            p.standardOutput = fh
-            p.standardError = fh
+        // ---- 桌面版增强 ----
+        menu.addItem(.separator())
+        let ssh = item("桌面版 SSH 入口", #selector(toggleSSH))
+        ssh.state = status.ssh.enabled ? .on : .off
+        ssh.toolTip = "让电脑上的 Antigravity 出现「Connect to SSH Host…」。不占端口。"
+        menu.addItem(ssh)
+        if status.ssh.enabled {
+            let d = status.ssh.running ? "已解锁 · 在 Antigravity 按 ⌘⇧P 搜 ssh" : status.ssh.detail
+            if !d.isEmpty { menu.addItem(info(d)) }
+        }
+        let zh = item("中文界面（桌面版）", #selector(toggleZh))
+        zh.state = status.zh.enabled ? .on : .off
+        menu.addItem(zh)
+        if status.zh.enabled, !status.zh.running, !status.zh.detail.isEmpty {
+            menu.addItem(info(status.zh.detail))
         }
 
-        do {
-            try p.run()
-            coreProcess = p
-            dlog("startWebService: 已启动 pid=\(p.processIdentifier) port=\(port)")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                self?.refresh()
-            }
-        } catch {
-            dlog("startWebService: 启动失败 \(error)")
-        }
-    }
-
-    func checkAndRestart(key: String, enabled: Bool, running: Bool, action: @escaping () -> Void) {
-        guard enabled, !running else { return }
-
-        let now = Date()
-        if let last = lastAutoStart[key], now.timeIntervalSince(last) < autoStartCooldown {
-            return
-        }
-        lastAutoStart[key] = now
-        dlog("guardServices: 检测到 \(key) 掉线，自动重启")
-        action()
-    }
-
-    /// 首次运行时把「登录时自动启动」打开。
-    ///
-    /// 只在第一次做，之后尊重用户的选择 ——
-    /// 如果用户主动关掉，下次启动不该又自动打开。
-    func enableLaunchAtLoginIfFirstRun() {
-        guard #available(macOS 13.0, *) else { return }
-        let key = "AGYHub.didSetupLaunchAtLogin"
-        guard !UserDefaults.standard.bool(forKey: key) else { return }
-
-        let svc = SMAppService.mainApp
-        if svc.status != .enabled {
-            do {
-                try svc.register()
-                dlog("enableLaunchAtLogin: 已注册登录项")
-            } catch {
-                dlog("enableLaunchAtLogin: 失败 \(error.localizedDescription)")
-            }
-        }
-        UserDefaults.standard.set(true, forKey: key)
-        rebuildMenu()
-    }
-
-    // MARK: 状态刷新
-
-    func refresh() {
-        // 记录"状态跳变"而不是每 3 秒都记。
-        //
-        // refresh 每 3 秒跑一次，如果每次都写日志，
-        // 一小时就是 1200 行，真正有用的信息全被冲掉了。
-        // 只在某个服务从 运行↔停止 变化时记一笔，这样日志里
-        // 留下的全是"事件"，用户传日志过来一眼能看到问题在哪。
-        let prevRunning = status.running
-        let prevWeb = status.web.running
-        let prevSSHWeb = status.sshWeb.running
-        let prevCA = status.caTrusted
-
-        if let s = fetchStatus(port: port) {
-            status = s
-
-            if prevWeb != s.web.running {
-                dlog("状态变化: 网页版 \(prevWeb ? "运行" : "停止") → \(s.web.running ? "运行" : "停止") port=\(s.web.port)")
-            }
-            if prevSSHWeb != s.sshWeb.running {
-                dlog("状态变化: SSH网页版 \(prevSSHWeb ? "运行" : "停止") → \(s.sshWeb.running ? "运行" : "停止") port=\(s.sshWeb.port)")
-            }
-            if prevCA != s.caTrusted {
-                dlog("状态变化: 根证书 \(prevCA ? "已信任" : "未信任") → \(s.caTrusted ? "已信任" : "未信任")")
-            }
-            if prevRunning != s.running {
-                dlog("状态变化: 整体 \(prevRunning ? "运行" : "停止") → \(s.running ? "运行" : "停止")")
-            }
-            // ⚠️ 不要在这里把 port 改成 s.web.port。
-            //
-            // 早期这么写过，导致：用户自定义端口后，下一次 refresh
-            // 又把它改回内核记录的旧值，看起来像"改了个假端口"。
-            // 端口只有一个真相 —— 内核配置文件。Swift 侧不需要维护副本，
-            // 每次启动服务前都重新 pick-port / 读配置即可。
-        } else {
-            // 拿不到状态本身是个重要信号（内核崩了/被删了/权限不足），
-            // 但也别每 3 秒刷一次 —— 只在"从有到无"的瞬间记。
-            if prevRunning {
-                dlog("⚠️ 读不到内核状态，切到离线模式（内核可能已退出）")
-            }
-            status = .offline(port: port)
-        }
-        updateIcon()
-        rebuildMenu()
-    }
-
-    // MARK: 菜单
-
-    func rebuildMenu() {
-        let menu = NSMenu()
-
-        // ---- 标题 ----
-        let title = NSMenuItem(title: "AgyHub  v\(status.version)", action: nil, keyEquivalent: "")
-        title.isEnabled = false
-        menu.addItem(title)
-
-        let stateText: String
-        if status.web.running || status.ssh.running {
-            stateText = status.upstreamOk ? "● 正在运行" : "● 运行中，但 Antigravity 未打开"
-        } else {
-            stateText = "○ 服务未启动"
-        }
-        let stateItem = NSMenuItem(title: stateText, action: nil, keyEquivalent: "")
-        stateItem.isEnabled = false
-        menu.addItem(stateItem)
+        // ---- 设置 ----
+        menu.addItem(.separator())
+        menu.addItem(item("更换访问口令", #selector(rotateToken)))
+        let login = item("登录时自动启动", #selector(toggleLaunchAtLogin))
+        login.state = launchAtLoginEnabled() ? .on : .off
+        menu.addItem(login)
 
         menu.addItem(.separator())
-
-        // ---- 启动/停止 ----
-        if status.web.running || status.ssh.running {
-            let stop = NSMenuItem(title: "停止服务", action: #selector(stopAll), keyEquivalent: "")
-            stop.target = self
-            menu.addItem(stop)
-        } else {
-            let start = NSMenuItem(title: "启动服务", action: #selector(startAll), keyEquivalent: "")
-            start.target = self
-            menu.addItem(start)
-        }
-
-        // ---- 三个服务的开关（服务运行后才显示）----
-        if status.web.running || status.ssh.running || status.sshWeb.running {
-            menu.addItem(.separator())
-
-            // 网页版（本机 Antigravity 的网页界面）
-            let webItem = NSMenuItem(
-                title: "启动网页版（手机连接内网可访问）",
-                action: #selector(toggleWeb),
-                keyEquivalent: ""
-            )
-            webItem.target = self
-            webItem.state = status.web.enabled ? .on : .off
-            menu.addItem(webItem)
-
-            if status.web.enabled {
-                addServiceDetail(to: menu, svc: status.web, kind: .web)
-            }
-
-            // SSH 网页版（转发远端开发机的界面）
-            let sshWebItem = NSMenuItem(
-                title: "启动 SSH 网页版（手机连接内网可访问）",
-                action: #selector(toggleSSHWeb),
-                keyEquivalent: ""
-            )
-            sshWebItem.target = self
-            sshWebItem.state = status.sshWeb.enabled ? .on : .off
-            menu.addItem(sshWebItem)
-
-            if status.sshWeb.enabled {
-                addServiceDetail(to: menu, svc: status.sshWeb, kind: .sshWeb)
-            }
-
-            // SSH（桌面版命令面板入口解锁）
-            let sshItem = NSMenuItem(
-                title: "启动 SSH",
-                action: #selector(toggleSSH),
-                keyEquivalent: ""
-            )
-            sshItem.target = self
-            sshItem.state = status.ssh.enabled ? .on : .off
-            menu.addItem(sshItem)
-
-            if status.ssh.enabled {
-                addServiceDetail(to: menu, svc: status.ssh, kind: .ssh)
-            }
-
-            menu.addItem(.separator())
-
-            // 换口令
-            let rotate = NSMenuItem(
-                title: "更换访问口令",
-                action: #selector(rotateToken),
-                keyEquivalent: "r"
-            )
-            rotate.target = self
-            menu.addItem(rotate)
-
-            if !status.token.isEmpty {
-                let tok = NSMenuItem(
-                    title: "  口令：\(status.token)（点击复制）",
-                    action: #selector(copyToken),
-                    keyEquivalent: ""
-                )
-                tok.target = self
-                menu.addItem(tok)
-            }
-        }
-
-        menu.addItem(.separator())
-
-        // ---- 证书 ----
-        if !status.caTrusted {
-            let trust = NSMenuItem(
-                title: "⚠︎ 安装根证书（消除不安全警告）",
-                action: #selector(installCertFromMenu),
-                keyEquivalent: ""
-            )
-            trust.target = self
-            menu.addItem(trust)
-        }
-
-        // ---- 中文界面 ----
-        //
-        // 这一项解决的是「Antigravity 一重启，中文包就失效」。
-        // 中文包的 daemon.py 是常驻的，自己会跟随重启重新注入；
-        // App 只要保证它一直在跑就行。
-        let zhItem = NSMenuItem(
-            title: "中文界面（Antigravity）",
-            action: #selector(toggleZh),
-            keyEquivalent: ""
-        )
-        zhItem.target = self
-        zhItem.state = status.zh.enabled ? .on : .off
-        menu.addItem(zhItem)
-
-        if status.zh.enabled {
-            let zhState = NSMenuItem(
-                title: status.zh.running ? "    已注入（重启 Antigravity 也会自动恢复）" : "    守护未运行",
-                action: nil, keyEquivalent: ""
-            )
-            zhState.isEnabled = false
-            menu.addItem(zhState)
-        }
-
-        // ---- 登录时启动 ----
-        let launchAtLogin = NSMenuItem(
-            title: "登录时自动启动",
-            action: #selector(toggleLaunchAtLogin),
-            keyEquivalent: ""
-        )
-        launchAtLogin.target = self
-        launchAtLogin.state = launchAtLoginEnabled() ? .on : .off
-        menu.addItem(launchAtLogin)
-
-        menu.addItem(.separator())
-
-        if updaterController != nil {
-            let check = NSMenuItem(
-                title: "检查更新…",
-                action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)),
-                keyEquivalent: ""
-            )
-            check.target = updaterController
+        if let u = updaterController {
+            let check = NSMenuItem(title: "检查更新…",
+                                   action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)),
+                                   keyEquivalent: "")
+            check.target = u
             menu.addItem(check)
         }
-
-        let logs = NSMenuItem(title: "查看日志", action: #selector(openLog), keyEquivalent: "l")
-        logs.target = self
-        menu.addItem(logs)
-
-        let about = NSMenuItem(title: "这个 App 怎么用？", action: #selector(showAbout), keyEquivalent: "")
-        about.target = self
-        menu.addItem(about)
-
+        menu.addItem(item("查看日志（含自检）", #selector(openLog), key: "l"))
+        menu.addItem(item("使用说明", #selector(showAbout)))
         menu.addItem(.separator())
-        let quit = NSMenuItem(title: "退出 AgyHub", action: #selector(quitApp), keyEquivalent: "q")
-        quit.target = self
-        menu.addItem(quit)
-
-        statusItem.menu = menu
+        menu.addItem(item("退出 AgyHub（同时停止服务）", #selector(quitApp), key: "q"))
     }
 
-    enum ServiceKind { case web, ssh, sshWeb }
-
-    /// 在开关下面加详情行：端口、URL、操作按钮。
-    ///
-    /// 设计取舍（按用户要求调整过）：
-    ///   · 端口行括号里只说「点击可修改」，不再提"被占用/已自动改" ——
-    ///     用户不关心技术原因，只想知道能不能点。
-    ///   · 链接下面不再是"在本机打开"这种说明文字，而是两个明确的按钮：
-    ///     打开 / 复制。打开用链接原样（LAN IP），不用 localhost ——
-    ///     因为用户可能拿着这个链接到手机上验证，用 localhost 会打不开。
-    func addServiceDetail(to menu: NSMenu, svc: ServiceStatus, kind: ServiceKind) {
-        // ---- 端口行 ----
-        //
-        // ⚠️ 「启动 SSH」（桌面版入口解锁）**不显示端口**。
-        //   它靠 CDP 注入实现，压根不监听端口，显示端口只会让人困惑
-        //   （用户的原话：为什么启动 SSH 有端口？）。
-        //   真正需要端口的是「SSH 网页版」，那是另一项。
-        if kind != .ssh {
-            let portItem = NSMenuItem(
-                title: "    端口 \(svc.port)（点击可修改）",
-                action: #selector(changePort(_:)),
-                keyEquivalent: ""
-            )
-            portItem.target = self
-            portItem.representedObject = portKindString(kind)
-            portItem.toolTip = "点击修改端口"
-            menu.addItem(portItem)
+    func addServiceDetail(_ menu: NSMenu, key: String, svc: ServiceStatus) {
+        if let b = busy[key] {
+            menu.addItem(info(b))
+            return
         }
-
-        // ---- 链接 + 两个按钮 ----
-        switch kind {
-        case .web, .sshWeb:
-            if !svc.url.isEmpty {
-                // 链接本身：点击 = 在本机浏览器打开。
-                //
-                // 为什么不保留「打开」那个独立按钮（用户要求）：
-                //   链接文字本身已经写在菜单里了，旁边再放一个"打开"
-                //   属于同一个动作的两种表达，纯重复。
-                //   现在点链接就是打开，另有「复制链接」负责发到手机。
-                let urlItem = NSMenuItem(
-                    title: "    \(svc.url)",
-                    action: #selector(openServiceURL(_:)),
-                    keyEquivalent: ""
-                )
-                urlItem.target = self
-                urlItem.representedObject = svc.url
-                urlItem.toolTip = "点击在浏览器中打开"
-                menu.addItem(urlItem)
-
-                let copyItem = NSMenuItem(
-                    title: "    复制链接",
-                    action: #selector(copyServiceURL(_:)),
-                    keyEquivalent: ""
-                )
-                copyItem.target = self
-                copyItem.representedObject = svc.url
-                menu.addItem(copyItem)
-            } else if !svc.running {
-                let hint = NSMenuItem(title: "    未运行", action: nil, keyEquivalent: "")
-                hint.isEnabled = false
-                menu.addItem(hint)
+        if svc.running {
+            if !svc.lastError.isEmpty {
+                let first = svc.lastError.split(separator: "\n").first.map(String.init) ?? svc.lastError
+                menu.addItem(item("⚠︎ \(String(first.prefix(60)))（点击查看）", #selector(showError(_:)), obj: svc.lastError, indent: 1))
             }
+            let url = svc.url
+            let u = item(url, #selector(openServiceURL(_:)), obj: url, indent: 1)
+            u.toolTip = "点击在本机浏览器打开"
+            menu.addItem(u)
+            menu.addItem(item("复制链接", #selector(copyServiceURL(_:)), obj: url, indent: 1))
+            menu.addItem(item("显示二维码（手机扫码打开）", #selector(showQRItem(_:)), obj: key, indent: 1))
+        } else if svc.starting {
+            menu.addItem(info(key == "ssh_web" ? "正在连接开发机…" : "正在启动…"))
+        } else if !svc.lastError.isEmpty {
+            let first = svc.lastError.split(separator: "\n").first.map(String.init) ?? svc.lastError
+            let e = item("⚠︎ \(String(first.prefix(60)))（点击查看）", #selector(showError(_:)), obj: svc.lastError, indent: 1)
+            menu.addItem(e)
+            menu.addItem(item("重试", #selector(retryService(_:)), obj: key, indent: 1))
+        } else if key == "ssh_web" && svc.target.isEmpty {
+            // 上面已经有"未选择"那一行
+        } else {
+            menu.addItem(info("未运行"))
+        }
+        let p = item("端口 \(svc.port)（点击修改）", #selector(changePort(_:)), obj: key, indent: 1)
+        menu.addItem(p)
+    }
 
-        case .ssh:
-            // 桌面版入口：不监听端口、没有 URL。
-            // 作用是在 Antigravity 里让「Connect to SSH Host…」出现。
-            let hint = NSMenuItem(
-                title: svc.running
-                    ? "    已解锁 · 在 Antigravity 按 ⌘⇧P 搜 ssh"
-                    : "    未运行 · 点击上方开关启动",
-                action: nil, keyEquivalent: ""
-            )
-            hint.isEnabled = false
-            menu.addItem(hint)
+    // MARK: 菜单动作 —— 服务开关
 
-            let note = NSMenuItem(
-                title: "    这一项是让电脑桌面版能用 SSH，不占端口",
-                action: nil, keyEquivalent: ""
-            )
-            note.isEnabled = false
-            menu.addItem(note)
+    @objc func toggleWeb() {
+        userTouched["web"] = Date()
+        let on = !status.web.enabled
+        status.web.enabled = on
+        perform("web", on ? "正在启动…" : "正在停止…", ["set-enabled", "web", on ? "1" : "0"], timeout: 10) { [weak self] _ in
+            guard let self else { return }
+            self.retryCount["web"] = 0
+            self.retryAt["web"] = nil
+            if on { self.startService("web") } else { self.stopService("web") }
         }
     }
 
-    func portKindString(_ kind: ServiceKind) -> String {
-        switch kind {
-        case .web: return "web"
-        case .ssh: return "ssh"
-        case .sshWeb: return "ssh_web"
+    @objc func toggleSSHWeb() {
+        userTouched["ssh_web"] = Date()
+        let on = !status.sshWeb.enabled
+        if on {
+            let target = status.sshWeb.target
+            if target.isEmpty {
+                promptSSHHost(current: "") { [weak self] t in
+                    guard let self, !t.isEmpty else { return }   // 用户取消：保持关闭
+                    self.status.sshWeb.enabled = true
+                    self.status.sshWeb.target = t
+                    self.enableAndStartSSHWeb(t)
+                }
+                return
+            }
+            status.sshWeb.enabled = true
+            enableAndStartSSHWeb(target)
+        } else {
+            status.sshWeb.enabled = false
+            perform("ssh_web", "正在停止…", ["set-enabled", "ssh_web", "0"], timeout: 10) { [weak self] _ in
+                self?.stopService("ssh_web")
+            }
         }
     }
 
-    /// 打开链接时用原样的 LAN IP 地址，**不换成 localhost**。
-    ///
-    /// 为什么：用户要验证的往往就是"手机能不能打开"。若在这里偷偷换成
-    /// localhost，本机能开、手机不能开，就会误判成功。
-    /// 局域网 IP 在本机也完全可访问，没必要换。
+    func enableAndStartSSHWeb(_ target: String) {
+        retryCount["ssh_web"] = 0
+        retryAt["ssh_web"] = nil
+        perform("ssh_web", "正在连接开发机…", ["set-enabled", "ssh_web", "1"], timeout: 10) { [weak self] _ in
+            self?.perform("ssh_web", "正在连接开发机…", ["start-ssh-web", "--target", target], timeout: 30) { obj in
+                if let ok = obj?["ok"] as? Bool, !ok {
+                    dlog("SSH 网页版启动失败: \(obj?["error"] as? String ?? "")")
+                }
+                self?.refresh()
+            }
+        }
+    }
+
+    @objc func chooseSSHTarget() {
+        let cur = status.sshWeb.target
+        promptSSHHost(current: cur) { [weak self] t in
+            guard let self, !t.isEmpty, t != cur else { return }
+            self.userTouched["ssh_web"] = Date()
+            self.status.sshWeb.target = t
+            self.enableAndStartSSHWeb(t)
+        }
+    }
+
+    @objc func retryService(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        retryCount[key] = 0
+        retryAt[key] = nil
+        startService(key)
+    }
+
+    /// SSH 主机选择（只在用户主动操作时弹出，守护逻辑永远不会弹）。
+    /// 读主机列表放在后台，避免菜单卡住。
+    func promptSSHHost(current: String, completion: @escaping (String) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let obj = runCoreJSON(["ssh-hosts"], timeout: 5)
+            let hosts = (obj?["hosts"] as? [String]) ?? []
+            DispatchQueue.main.async {
+                completion(self?.pickHost(hosts, current: current) ?? "")
+            }
+        }
+    }
+
+    func pickHost(_ hosts: [String], current: String) -> String {
+        NSApp.activate(ignoringOtherApps: true)
+        if hosts.isEmpty {
+            alert("没有可用的 SSH 主机", """
+            没有在 ~/.ssh/config 里找到可用的 Host。
+
+            请先配置一台开发机并确认能免密登录，例如：
+              Host dev
+                  HostName 1.2.3.4
+                  User you
+
+            在终端里执行 ssh dev 能直接登录（不问密码）就可以了。
+            """)
+            return ""
+        }
+        let a = NSAlert()
+        a.messageText = "选择要转发的开发机"
+        a.informativeText = """
+        手机打开后看到的是这台开发机上的 Antigravity 界面。
+
+        要求：
+        · 这台 Mac 能免密 ssh 到它
+        · 在 Mac 桌面版里连过它一次（让它装好 Antigravity 服务）
+        · 它自己能访问 Google，否则界面能用、一问 AI 就超时
+        """
+        a.addButton(withTitle: "确定")
+        a.addButton(withTitle: "取消")
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 260, height: 26))
+        popup.addItems(withTitles: hosts)
+        if !current.isEmpty { popup.selectItem(withTitle: current) }
+        a.accessoryView = popup
+        guard a.runModal() == .alertFirstButtonReturn else { return "" }
+        return popup.titleOfSelectedItem ?? ""
+    }
+
+    @objc func toggleSSH() {
+        let on = !status.ssh.enabled
+        if on {
+            let a = NSAlert()
+            a.messageText = "打开桌面版 SSH 入口"
+            a.informativeText = "Antigravity 的窗口会刷新一次（不影响正在进行的对话记录），之后在命令面板（⌘⇧P）里搜 ssh 就能看到「Connect to SSH Host…」。"
+            a.addButton(withTitle: "打开")
+            a.addButton(withTitle: "取消")
+            NSApp.activate(ignoringOtherApps: true)
+            guard a.runModal() == .alertFirstButtonReturn else { return }
+        }
+        status.ssh.enabled = on
+        perform("ssh", "", ["ssh-unlock"] + (on ? [] : ["off"]), timeout: 45) { [weak self] obj in
+            if on, let ok = obj?["ok"] as? Bool, !ok {
+                dlog("SSH 入口: \(obj?["error"] as? String ?? "")")
+            }
+            self?.refresh()
+        }
+    }
+
+    @objc func toggleZh() {
+        let on = !status.zh.enabled
+        status.zh.enabled = on
+        perform("zh", "", ["zh", on ? "on" : "off"], timeout: 45) { [weak self] obj in
+            dlog("中文界面 \(on ? "开" : "关"): \(obj?["message"] as? String ?? obj?["error"] as? String ?? "")")
+            if !on, let restored = obj?["ui_restored"] as? Bool, !restored {
+                self?.flash("刷新 Antigravity 后恢复英文")
+            }
+            self?.refresh()
+        }
+    }
+
+    // MARK: 菜单动作 —— 链接、二维码
+
     @objc func openServiceURL(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let u = URL(string: raw) else { return }
         NSWorkspace.shared.open(u)
@@ -773,479 +979,213 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func copyServiceURL(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String else { return }
-        copyToPasteboard(raw)
-        notify("链接已复制", "发到手机上打开即可")
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(raw, forType: .string)
+        flash("已复制")
     }
 
-    // MARK: 动作 —— 服务
+    @objc func showQRItem(_ sender: NSMenuItem) {
+        showQR(kind: (sender.representedObject as? String) ?? "web")
+    }
 
-    @objc func startAll() {
-        dlog("startAll: 进入")
-        guard let core = corePath() else {
-            dlog("startAll: 找不到内核 corePath=nil")
-            alert("找不到内核", "没有找到 agyhub 可执行文件。请先构建 agyhub-rs。")
+    func showQR(kind: String) {
+        let svc = kind == "web" ? status.web : status.sshWeb
+        NSApp.activate(ignoringOtherApps: true)
+        guard svc.running, !svc.url.isEmpty else {
+            alert("服务还没有运行", svc.lastError.isEmpty ? "稍等几秒再试。" : svc.lastError)
             return
         }
-
-        // 先让内核算好可用端口（会写回配置），再用该端口启动。
-        // 这样「启动服务」不会因为 8898 被占而静默失败。
-        if let d = runCore(["pick-port", "web"]),
-           let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-           let p = obj["port"] as? Int {
-            port = p
-        }
-
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: core)
-        p.arguments = ["--port", String(port)]
-
-        let logPath = logURL().path
-        FileManager.default.createFile(atPath: logPath, contents: nil)
-        if let fh = FileHandle(forWritingAtPath: logPath) {
-            fh.seekToEndOfFile()
-            p.standardOutput = fh
-            p.standardError = fh
-        }
-
-        do {
-            try p.run()
-            coreProcess = p
-            dlog("startAll: 已启动 pid=\(p.processIdentifier) port=\(port)")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                self?.refresh()
-            }
-        } catch {
-            dlog("startAll: 启动抛错 \(error)")
-            alert("启动失败", error.localizedDescription)
-        }
-
-        // 若 SSH 也是启用状态，一并把解锁守护拉起来
-        if status.ssh.enabled {
-            startSSHUnlock()
-        }
-
-        // SSH 网页版（转发开发机界面）
-        if status.sshWeb.enabled {
-            startSSHWebService()
-        }
-    }
-
-    /// 启动 SSH 网页版（agygate.py --ssh-target）。
-    ///
-    /// 第一次启动时如果还没选过开发机，就先弹一个列表让用户选 ——
-    /// 空着主机名直接启动只会失败，不如在这里问。
-    func startSSHWebService() {
-        guard status.sshWeb.pid == 0 else { return }
-
-        var target = status.sshWeb.target ?? ""
-        if target.isEmpty {
-            target = promptSSHHost()
-            if target.isEmpty { return }
-        }
-
-        dlog("startSSHWebService: target=\(target)")
-        if let d = runCore(["start-ssh-web", "--target", target]),
-           let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
-            if let ok = obj["ok"] as? Bool, !ok {
-                let msg = (obj["error"] as? String) ?? "未知错误"
-                dlog("startSSHWebService: 失败 \(msg)")
-                alert("SSH 网页版启动失败", msg)
-            }
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-            self?.refresh()
-        }
-    }
-
-    /// 弹出 SSH 主机选择列表。
-    func promptSSHHost() -> String {
-        guard let d = runCore(["ssh-hosts"]),
-              let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-              let hosts = obj["hosts"] as? [String],
-              !hosts.isEmpty
-        else {
-            alert("没有可用的 SSH 主机", """
-            没有在 ~/.ssh/config 里找到可用的 Host。
-
-            请先配置一台开发机，例如：
-              Host dev
-                  HostName 1.2.3.4
-                  User you
-            """)
-            return ""
-        }
-
         let a = NSAlert()
-        a.messageText = "选择要转发的开发机"
+        a.messageText = "用手机相机扫码打开"
+        var tips = "手机要和这台 Mac 连同一个 Wi-Fi。"
+        if !status.caTrusted {
+            tips += "\n首次打开会提示「不安全」：选「显示详细信息 → 访问此网站」（iPhone）或「高级 → 继续前往」（安卓），页面底部有安装证书的步骤。"
+        }
+        if status.fwBlocked {
+            tips += "\n⚠︎ 防火墙正在拦截连接，先按菜单里的提示放行。"
+        }
+        a.informativeText = tips
+        if let img = qrImage(svc.url) {
+            let v = NSImageView(frame: NSRect(x: 0, y: 0, width: 240, height: 240))
+            v.image = img
+            a.accessoryView = v
+        }
+        a.addButton(withTitle: "完成")
+        a.addButton(withTitle: "复制链接")
+        if a.runModal() == .alertSecondButtonReturn {
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.setString(svc.url, forType: .string)
+            flash("已复制")
+        }
+    }
+
+    @objc func showError(_ sender: NSMenuItem) {
+        guard let msg = sender.representedObject as? String else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        alert("启动失败的原因", msg)
+    }
+
+    @objc func showFirewallHelp() {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "macOS 防火墙拦截了 AgyHub"
         a.informativeText = """
-        SSH 网页版会把这台机器的界面转发到本机，手机打开就是它的完整界面。
+        电脑上一切正常，但手机的连接会被防火墙挡掉。
 
-        ⚠️ 该机器自己必须能访问 Google，否则界面能用、一问 AI 就超时。
+        放行方法：
+        1. 打开「系统设置 → 网络 → 防火墙 → 选项…」
+        2. 找到 agyhub，改为「允许传入连接」
+           （列表里没有就点 + 添加：/Applications/AgyHub.app/Contents/Resources/agyhub）
+        3. 如果开了「阻止所有传入连接」，需要关掉它
+
+        每次 AgyHub 升级后 macOS 可能会再问一次，选「允许」即可。
+        公司电脑的防火墙如果由管理员锁定，需要联系 IT。
         """
-        a.addButton(withTitle: "确定")
-        a.addButton(withTitle: "取消")
-
-        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 240, height: 26))
-        popup.addItems(withTitles: hosts)
-        a.accessoryView = popup
-
-        guard a.runModal() == .alertFirstButtonReturn else { return "" }
-        return popup.titleOfSelectedItem ?? ""
-    }
-
-    @objc func stopAll() {
-        // 只杀**我们自己记录到的** pid，不用 pkill 模式匹配。
-        //
-        // 这条纪律是被一次事故换来的：早期版本用 `pkill -f agygate.py`
-        // 之类的宽泛匹配，把用户从终端自己跑的那份远端网页版（8897）
-        // 一起杀掉了 —— 表现就是"昨天还能打开的 8897 打不开了"。
-        // 任何"按命令行特征杀进程"的写法都不安全，一律不用。
-        if status.web.pid > 0 {
-            kill(pid_t(status.web.pid), SIGTERM)
-        }
-        if let p = coreProcess, p.isRunning {
-            p.terminate()
-        }
-        coreProcess = nil
-
-        if status.ssh.pid > 0 {
-            kill(pid_t(status.ssh.pid), SIGTERM)
-        }
-
-        // SSH 网页版：只有"确认是我们启动的"才停。
-        // 判断依据是配置里记录的 target 与进程实际情况一致，且端口对的，
-        // 否则视作用户自己跑的，不动它。
-        if status.sshWeb.pid > 0 {
-            kill(pid_t(status.sshWeb.pid), SIGTERM)
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            self?.refresh()
+        a.addButton(withTitle: "打开系统设置")
+        a.addButton(withTitle: "知道了")
+        if a.runModal() == .alertFirstButtonReturn,
+           let u = URL(string: "x-apple.systempreferences:com.apple.Network-Settings.extension") {
+            NSWorkspace.shared.open(u)
         }
     }
 
-    @objc func toggleWeb() {
-        let on = !status.web.enabled
-        _ = runCore(["set-enabled", "web", on ? "1" : "0"])
-        if !on, status.web.pid > 0 {
-            kill(pid_t(status.web.pid), SIGTERM)
-        } else if on {
-            startAll()
-        }
-        refresh()
-    }
-
-    @objc func toggleSSH() {
-        let on = !status.ssh.enabled
-        _ = runCore(["set-enabled", "ssh", on ? "1" : "0"])
-        if on {
-            startSSHUnlock()
-        } else if status.ssh.pid > 0 {
-            kill(pid_t(status.ssh.pid), SIGTERM)
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            self?.refresh()
-        }
-    }
-
-    /// SSH 网页版的开关。
-    ///
-    /// 它和「SSH」不是一回事：
-    ///   · SSH（桌面版入口解锁）= 让 Antigravity 界面里出现 Connect to SSH Host
-    ///   · SSH 网页版 = 用 ssh 隧道把开发机界面转发到本机某个端口，
-    ///     手机打开就是开发机的完整界面（文件树、终端、AI 都在开发机上跑）
-    @objc func toggleSSHWeb() {
-        let on = !status.sshWeb.enabled
-        _ = runCore(["set-enabled", "ssh_web", on ? "1" : "0"])
-        if !on, status.sshWeb.pid > 0 {
-            kill(pid_t(status.sshWeb.pid), SIGTERM)
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            self?.refresh()
-        }
-    }
-
-    /// 启动 SSH 入口解锁。
-    ///
-    /// 原来这里 fork 一个 node 脚本（agy-ssh-unlock.cjs）常驻，
-    /// 通过 CDP 持续往 Antigravity 注入钩子。
-    ///
-    /// 现在改成调内核的 `ssh-unlock` 命令 —— 注入逻辑已经用 Rust
-    /// 重写并编译进二进制（src/actions.rs），不再需要 node。
-    ///
-    /// **为什么不再需要"常驻"**：原脚本常驻是为了给新开的窗口
-    /// 也自动注入（监听 attachedToTarget）。现在改为：
-    ///   · 一次性给当前所有页面装钩子
-    ///   · 装上的是 addScriptToEvaluateOnNewDocument，
-    ///     对之后的新导航同样生效
-    ///   · guardServices 每 3 秒巡检，发现钩子掉了就重新装
-    /// 这样不需要一个长期挂着的外部进程。
-    func startSSHUnlock() {
-        guard let d = runCore(["ssh-unlock"]),
-              let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any]
-        else {
-            dlog("startSSHUnlock: 内核无响应")
-            return
-        }
-
-        if let ok = obj["ok"] as? Bool, ok {
-            dlog("startSSHUnlock: \(obj["message"] as? String ?? "已注入")")
-        } else {
-            let msg = (obj["error"] as? String) ?? "未知错误"
-            dlog("startSSHUnlock: \(msg)")
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            self?.refresh()
-        }
-    }
-
-    // MARK: 动作 —— 口令与链接
+    // MARK: 菜单动作 —— 口令、端口
 
     @objc func rotateToken() {
-        guard let d = runCore(["rotate-token"]),
-              let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-              let t = obj["token"] as? String
-        else {
-            alert("更换口令失败", "内核没有返回新口令。")
-            return
-        }
-        refresh()
-        let a = NSAlert()
-        a.messageText = "口令已更换"
-        a.informativeText = """
-        新口令：\(t)
+        NSApp.activate(ignoringOtherApps: true)
+        let c = NSAlert()
+        c.messageText = "更换访问口令？"
+        c.informativeText = "手机上已经打开的页面、装好的应用（PWA）都要用新链接重新打开一次。"
+        c.addButton(withTitle: "更换")
+        c.addButton(withTitle: "取消")
+        guard c.runModal() == .alertFirstButtonReturn else { return }
 
-        已保存，重启 App 不会变。
-        手机上的旧链接会失效，请重新复制：
-        \(status.web.url)
-        """
-        a.addButton(withTitle: "复制新链接")
-        a.addButton(withTitle: "知道了")
-        if a.runModal() == .alertFirstButtonReturn {
-            copyToPasteboard(status.web.url)
+        perform("token", "", ["rotate-token"], timeout: 10) { [weak self] obj in
+            guard let self else { return }
+            guard obj?["token"] is String else {
+                self.alert("更换口令失败", "内核没有返回新口令，请看日志。")
+                return
+            }
+            // 运行中的服务 1 秒内自动改用新口令，不需要重启
+            self.refresh {
+                let a = NSAlert()
+                a.messageText = "口令已更换，立即生效"
+                a.informativeText = "旧链接已经失效。用新链接（或二维码）重新打开即可。"
+                a.addButton(withTitle: "显示二维码")
+                a.addButton(withTitle: "复制新链接")
+                a.addButton(withTitle: "知道了")
+                let r = a.runModal()
+                if r == .alertFirstButtonReturn {
+                    self.showQR(kind: "web")
+                } else if r == .alertSecondButtonReturn {
+                    let pb = NSPasteboard.general
+                    pb.clearContents()
+                    pb.setString(self.status.web.url, forType: .string)
+                    self.flash("已复制")
+                }
+            }
         }
     }
 
-    /// 修改服务端口。
-    ///
-    /// 用 NSAlert + 输入框而不是子菜单预设列表：用户可能想用任意端口，
-    /// 预设列表总会漏。输入后由内核校验（是否被占、是否与服务冲突），
-    /// 校验不过就把内核给的原因原样显示出来。
     @objc func changePort(_ sender: NSMenuItem) {
-        let which = (sender.representedObject as? String) ?? "web"
-        let svc = which == "web" ? status.web : status.ssh
-        let name = which == "web" ? "网页版" : "SSH"
+        let key = (sender.representedObject as? String) ?? "web"
+        let svc = key == "web" ? status.web : status.sshWeb
+        let name = key == "web" ? "本机网页版" : "SSH 网页版"
 
+        NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
         a.messageText = "修改\(name)端口"
-        a.informativeText = """
-        当前端口：\(svc.port)
-
-        输入新端口（1024–65535）。如果被其他程序占用，会提示并建议可用端口。
-        """
+        a.informativeText = "当前端口：\(svc.port)\n输入 1024–65535 之间的数字。改端口后手机上的旧链接会失效。"
         a.addButton(withTitle: "确定")
         a.addButton(withTitle: "取消")
-
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
         input.stringValue = String(svc.port)
         a.accessoryView = input
-
-        // 让输入框自动获得焦点，用户可以直接敲数字
         a.window.initialFirstResponder = input
-
         guard a.runModal() == .alertFirstButtonReturn else { return }
 
         let v = input.stringValue.trimmingCharacters(in: .whitespaces)
-        guard let port = Int(v), port > 0, port <= 65535 else {
+        guard let port = Int(v), port >= 1024, port <= 65535 else {
             alert("端口无效", "请输入 1024 到 65535 之间的数字。")
             return
         }
+        applyPort(key, port)
+    }
 
-        guard let d = runCore(["set-port", which, String(port)]),
-              let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any]
-        else {
-            alert("设置失败", "内核没有响应。")
-            return
-        }
-
-        if let ok = obj["ok"] as? Bool, !ok {
-            // 内核已经把原因和建议写好了，直接显示
-            let msg = (obj["error"] as? String) ?? "未知错误"
-            let sug = obj["suggestion"] as? Int
-            let b = NSAlert()
-            b.messageText = "无法使用端口 \(port)"
-            b.informativeText = msg
-            b.alertStyle = .warning
-            if let s = sug {
-                b.addButton(withTitle: "改用 \(s)")
-                b.addButton(withTitle: "取消")
-                if b.runModal() == .alertFirstButtonReturn {
-                    _ = runCore(["set-port", which, String(s)])
-                    restIfNeeded()
-                    refresh()
+    func applyPort(_ key: String, _ port: Int) {
+        perform(key, "正在修改端口…", ["set-port", key, String(port)], timeout: 10) { [weak self] obj in
+            guard let self else { return }
+            guard let obj else {
+                self.alert("设置失败", "内核没有响应。")
+                return
+            }
+            if let ok = obj["ok"] as? Bool, !ok {
+                let msg = (obj["error"] as? String) ?? "未知错误"
+                let b = NSAlert()
+                b.messageText = "无法使用端口 \(port)"
+                b.informativeText = msg
+                b.alertStyle = .warning
+                if let s = obj["suggestion"] as? Int {
+                    b.addButton(withTitle: "改用 \(s)")
+                    b.addButton(withTitle: "取消")
+                    if b.runModal() == .alertFirstButtonReturn { self.applyPort(key, s) }
+                } else {
+                    b.addButton(withTitle: "知道了")
+                    b.runModal()
                 }
+                return
+            }
+            // 正在运行的服务要重启才会换到新端口
+            if (obj["restart_needed"] as? Bool) == true {
+                self.stopService(key) { self.startService(key) }
             } else {
-                b.addButton(withTitle: "知道了")
-                b.runModal()
+                self.refresh()
             }
-            return
-        }
-
-        restIfNeeded()
-        refresh()
-    }
-
-    /// 端口改动后需要重启对应服务才生效。
-    ///
-    /// 只对正在运行的服务做重启，没跑的不动 —— 免得用户只是改个配置
-    /// 却意外启动了服务。
-    func restIfNeeded() {
-        if status.web.running || status.ssh.running {
-            stopAll()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                self?.startAll()
-            }
-        }
-    }
-
-    @objc func copyToken() {
-        guard !status.token.isEmpty else { return }
-        copyToPasteboard(status.token)
-        notify("口令已复制", status.token)
-    }
-
-    /// 开关中文界面。
-    @objc func toggleZh() {
-        let turnOn = !status.zh.enabled
-        let action = turnOn ? "on" : "off"
-        dlog("toggleZh: action=\(action) 当前 enabled=\(status.zh.enabled)")
-
-        guard let d = runCore(["zh", action]),
-              let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any]
-        else {
-            dlog("toggleZh: 内核无响应")
-            alert("中文界面设置失败", "内核没有返回结果，请看日志。")
-            return
-        }
-
-        if let ok = obj["ok"] as? Bool, !ok {
-            let msg = (obj["error"] as? String) ?? "未知错误"
-            dlog("toggleZh: \(msg)")
-            alert("中文界面设置失败", msg)
-            return
-        }
-
-        // 直接按内核返回的结果更新勾选状态，不等下一次轮询。
-        //
-        // 为什么要这样：`zh off` 内部要跑 stop-zh.cjs（连 CDP + 刷新页面），
-        // 可能要 1~2 秒。之前固定等 1.5 秒再 refresh，
-        // 偶尔比它快，读到的还是旧状态 —— 用户看到的就是"点了勾没取消"。
-        if let enabled = obj["enabled"] as? Bool {
-            status.zh.enabled = enabled
-            status.zh.running = (obj["running"] as? Bool) ?? false
-        }
-        rebuildMenu()
-
-        // 界面是否真的还原了：只有关闭时才有这个字段
-        if action == "off", let restored = obj["ui_restored"] as? Bool, !restored {
-            dlog("toggleZh: 界面未还原，提示用户")
-        }
-
-        // 稍后再刷一次，兼顾后台进程真实状态的同步
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-            self?.refresh()
         }
     }
 
     // MARK: 证书
 
-    /// 自动安装根证书（仅在尚未安装时）。
-    ///
-    /// 判据优先用内核 `status` 里的 `ca_trusted` 字段：
-    /// 它比直接跑 `security find-certificate` 更可靠，
-    /// 因为内核那边还会检查信任设置（不只是"证书在不在库里"）。
-    func autoInstallCertIfNeeded() {
-        // 已经信任了就什么都不做
-        if status.caTrusted {
-            dlog("autoInstallCert: 已信任，跳过")
-            return
-        }
-        dlog("autoInstallCert: 未信任，开始自动安装")
-        installCert(auto: true)
-    }
-
-    /// 菜单点击入口（无参，供 #selector 使用）。
     @objc func installCertFromMenu() {
-        installCert(auto: false)
+        installCert(thenShowQR: false)
     }
 
-    /// 安装根证书。
-    ///
-    /// - Parameter auto: 是否由启动流程自动触发（用于区分日志与提示方式）
-    func installCert(auto: Bool) {
-        guard let core = corePath() else {
-            dlog("installCert: 找不到内核")
-            return
-        }
-        dlog("installCert: 开始（auto=\(auto)）")
+    /// 安装根证书（后台运行：要等用户在系统弹窗里输密码，可能要很久）。
+    func installCert(thenShowQR: Bool) {
+        dlog("installCert: 开始")
+        if busy["cert"] != nil { return }
+        busy["cert"] = "正在安装证书…"
+        certQueue.async { [weak self] in
+            let r = runCoreText(["trust-cert"], timeout: 240)
+            for line in r.text.split(separator: "\n") {
+                let t = line.trimmingCharacters(in: .whitespaces)
+                if !t.isEmpty { dlog("installCert| \(t)") }
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.busy["cert"] = nil
+                self.refresh {
+                    NSApp.activate(ignoringOtherApps: true)
+                    if self.status.caTrusted {
+                        if thenShowQR {
+                            self.showQR(kind: "web")
+                        } else {
+                            self.alert("证书已安装", """
+                            这台 Mac 上的浏览器已经信任 AgyHub。若仍提示不安全，完全退出浏览器再打开。
 
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: core)
-        p.arguments = ["trust-cert"]
+                            手机要单独装一次：手机打开链接后，按页面底部的提示操作。
+                            """)
+                        }
+                    } else {
+                        self.alert("证书没有装上", """
+                        可能是在密码框点了取消，或者这台电脑不允许修改证书设置（公司电脑常见）。
 
-        // 捕获输出，装失败时能说清原因
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = pipe
-
-        do {
-            try p.run()
-        } catch {
-            dlog("installCert: 启动失败 \(error)")
-            if !auto { alert("安装证书失败", error.localizedDescription) }
-            return
-        }
-        p.waitUntilExit()
-
-        let out = String(
-            data: pipe.fileHandleForReading.readDataToEndOfFile(),
-            encoding: .utf8
-        ) ?? ""
-        // 内核的输出逐行写进日志，出问题时用户传日志就能定位
-        for line in out.split(separator: "\n") {
-            let t = line.trimmingCharacters(in: .whitespaces)
-            if !t.isEmpty { dlog("installCert| \(t)") }
-        }
-
-        let ok = p.terminationStatus == 0
-        dlog("installCert: 结束 status=\(p.terminationStatus) 输出长度=\(out.count)")
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            guard let self else { return }
-            self.refresh()
-            // 自动安装失败才提示（成功就不打扰）
-            if auto && !self.status.caTrusted {
-                self.alert("证书还没装上", """
-                App 尝试自动安装根证书但没成功。
-
-                你可以在菜单里点「安装证书」再试一次，
-                或者在终端里执行：
-
-                  \(core) trust-cert
-
-                装不上会导致手机访问时一直提示"不安全"。
-                """)
-            } else if !auto && ok {
-                self.alert("证书已安装", """
-                根证书已加入钥匙串并设为受信任。
-
-                如果浏览器仍提示不安全，请：
-                  1. 完全退出浏览器再打开
-                  2. 或点「安装证书」并选择 -force 重写信任设置
-
-                手机端需要单独安装一次：
-                在手机上打开 https://电脑IP:\(self.status.web.port)/__agy/ca.crt
-                """)
+                        可以稍后在菜单里点「安装根证书」再试。没有证书也能用，只是浏览器会提示「不安全」，并且不能装成手机应用。
+                        """)
+                    }
+                }
             }
         }
     }
@@ -1253,17 +1193,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: 登录时启动
 
     func launchAtLoginEnabled() -> Bool {
-        if #available(macOS 13.0, *) {
-            return SMAppService.mainApp.status == .enabled
+        SMAppService.mainApp.status == .enabled
+    }
+
+    /// 首次运行时打开「登录时自动启动」。只做一次，之后尊重用户的选择。
+    func enableLaunchAtLoginIfFirstRun() {
+        let key = "AGYHub.didSetupLaunchAtLogin"
+        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        // 不在 /Applications 里运行时不注册：登录项会指向一个之后不存在的路径
+        guard Bundle.main.bundlePath.hasPrefix("/Applications/") else { return }
+        UserDefaults.standard.set(true, forKey: key)
+        let svc = SMAppService.mainApp
+        if svc.status != .enabled {
+            do {
+                try svc.register()
+                dlog("已注册登录项")
+            } catch {
+                dlog("注册登录项失败: \(error.localizedDescription)")
+            }
         }
-        return false
     }
 
     @objc func toggleLaunchAtLogin() {
-        guard #available(macOS 13.0, *) else {
-            alert("系统版本过低", "需要 macOS 13 或更高版本。")
-            return
-        }
         let svc = SMAppService.mainApp
         do {
             if svc.status == .enabled {
@@ -1272,91 +1223,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try svc.register()
             }
         } catch {
+            NSApp.activate(ignoringOtherApps: true)
             alert("设置失败", """
             \(error.localizedDescription)
 
-            可以直接在「系统设置 → 通用 → 登录项」里手动添加：
-            \(Bundle.main.bundlePath)
+            可以在「系统设置 → 通用 → 登录项」里手动添加 AgyHub。
             """)
         }
-        rebuildMenu()
+        if svc.status == .requiresApproval {
+            NSApp.activate(ignoringOtherApps: true)
+            alert("还需要你确认一下", "请在「系统设置 → 通用 → 登录项」里打开 AgyHub 的开关。")
+            SMAppService.openSystemSettingsLoginItems()
+        }
+    }
+
+    // MARK: 日志
+
+    /// 打开日志：汇总 App、网页版、SSH 网页版三份日志，附上自检结果，口令已隐藏。
+    /// 用户把这一个文件发过来就能定位问题。
+    @objc func openLog() {
+        flash("正在生成…")
+        actionQueue.async {
+            let doctor = runCoreText(["doctor"], timeout: 30).text
+            var out = """
+            ========================================================
+             AgyHub 日志汇总（访问口令已隐藏，可以直接发给别人）
+             生成时间：\(Date())
+             系统：\(ProcessInfo.processInfo.operatingSystemVersionString)
+             App 版本：\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?")
+             程序路径：\(Bundle.main.bundlePath)
+            ========================================================
+
+            ---------- 自检（agyhub doctor）----------
+            \(doctor)
+
+            """
+            for name in ["AgyHub-debug.log", "AgyHub.log", "AgyHub-sshweb.log"] {
+                out += "---------- \(name) ----------\n"
+                let u = logsDir.appendingPathComponent(name)
+                if let txt = try? String(contentsOf: u, encoding: .utf8), !txt.isEmpty {
+                    let lines = txt.split(separator: "\n", omittingEmptySubsequences: false)
+                    if lines.count > 1500 { out += "（只显示最后 1500 行）\n" }
+                    out += lines.suffix(1500).joined(separator: "\n")
+                    if !txt.hasSuffix("\n") { out += "\n" }
+                } else {
+                    out += "（文件不存在或为空）\n"
+                }
+                out += "\n"
+            }
+            let url = logsDir.appendingPathComponent("AgyHub-汇总.txt")
+            try? redact(out).write(to: url, atomically: true, encoding: .utf8)
+            DispatchQueue.main.async {
+                NSWorkspace.shared.open(url)
+            }
+        }
     }
 
     // MARK: 其它
 
-    /// 打开日志。
-    ///
-    /// 原来只打开 AgyHub-debug.log 一个文件 —— 但实际日志分散在四个地方：
-    ///   · AgyHub-debug.log    Swift 外壳（服务启停、状态变化）
-    ///   · AgyHub-sshweb.log   SSH 网页版内核（隧道、转发错误）
-    ///   · AgyHub-zh.log       中文注入
-    ///   · AgyHub-boot.log     启动诊断
-    /// 用户点"查看日志"却只看到一个几乎空白的文件，会以为日志坏了。
-    ///
-    /// 现在：先把全部日志汇总成一个带时间线的总览，再用文本编辑器打开。
-    @objc func openLog() {
-        let agg = aggregateLogs()
-        let url = logURL().deletingLastPathComponent()
-            .appendingPathComponent("AgyHub-all.log")
-        try? agg.write(to: url, atomically: true, encoding: .utf8)
-        NSWorkspace.shared.open(url)
-    }
-
-    /// 把四个日志文件合并成一份带分隔的文本。
-    ///
-    /// 按文件分组而不是按时间穿插：各文件时间戳格式不同
-    /// （Swift 是 ISO8601，内核是 RFC3339 带纳秒），
-    /// 混排反而看不清谁是谁。
-    func aggregateLogs() -> String {
-        let dir = logURL().deletingLastPathComponent()
-        let files = [
-            "AgyHub-debug.log",
-            "AgyHub-sshweb.log",
-            "AgyHub-zh.log",
-            "AgyHub-boot.log",
-        ]
-        var out = """
-        ========================================================
-         AgyHub 日志汇总
-         生成时间：\(Date())
-         系统：\(ProcessInfo.processInfo.operatingSystemVersionString)
-         App 版本：\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?")
-         程序路径：\(Bundle.main.bundlePath)
-        ========================================================
-
-
-        """
-        for name in files {
-            let u = dir.appendingPathComponent(name)
-            out += "---------- \(name) ----------\n"
-            if let txt = try? String(contentsOf: u, encoding: .utf8), !txt.isEmpty {
-                // 只保留最后 2000 行，避免文件过大打不开
-                let lines = txt.split(separator: "\n", omittingEmptySubsequences: false)
-                if lines.count > 2000 {
-                    out += "（文件较大，只显示最后 2000 行）\n"
-                    out += lines.suffix(2000).joined(separator: "\n")
-                } else {
-                    out += txt
-                }
-                if !txt.hasSuffix("\n") { out += "\n" }
-            } else {
-                out += "（文件不存在或为空）\n"
-            }
-            out += "\n\n"
-        }
-        return out
-    }
-
     @objc func showAbout() {
+        NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
-        a.messageText = "AgyHub 在菜单栏里，不在 Dock"
+        a.messageText = "AgyHub 使用说明"
         a.informativeText = """
-        它是一个纯菜单栏 App：不占 Dock、不在启动台、不进 Cmd+Tab。
-        图标在屏幕右上角菜单栏，形状是一个带贯穿弧的 A。
+        AgyHub 在屏幕右上角菜单栏（不在 Dock）。
 
-        · 启动服务 → 下面会出现「启动网页版」「启动 SSH」两个开关
-        · 点链接那一行 = 复制到剪贴板，发给手机就能打开
-        · 端口被占用时会自动换一个，无需手动改
+        · 本机网页版：手机打开这台 Mac 上的 Antigravity。
+          点「显示二维码」，手机相机扫一下即可（需同一个 Wi-Fi）。
+        · SSH 网页版：手机打开开发机上的 Antigravity（需要免密 ssh）。
+        · 桌面版 SSH 入口：让电脑版 Antigravity 出现 Connect to SSH Host。
+        · 中文界面：电脑版 Antigravity 显示中文，重启后自动恢复。
+
+        手机提示「不安全」：按页面底部的步骤装一次证书。
+        打不开：点「查看日志」，把生成的文件发给作者。
 
         程序位置：\(Bundle.main.bundlePath)
         """
@@ -1370,36 +1309,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func quitApp() {
         NSApplication.shared.terminate(nil)
-    }
-
-    func logURL() -> URL {
-        let dir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Logs")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("AgyHub.log")
-    }
-
-    func copyToPasteboard(_ s: String) {
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(s, forType: .string)
-    }
-
-    /// 用现代 UserNotifications 框架（NSUserNotification 从 macOS 11 起废弃）。
-    func notify(_ title: String, _ body: String) {
-        let center = UNUserNotificationCenter.current()
-        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
-            guard granted else { return }
-            let content = UNMutableNotificationContent()
-            content.title = title
-            content.body = body
-            let req = UNNotificationRequest(
-                identifier: UUID().uuidString,
-                content: content,
-                trigger: nil
-            )
-            center.add(req, withCompletionHandler: nil)
-        }
     }
 
     func alert(_ title: String, _ body: String) {

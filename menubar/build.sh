@@ -19,7 +19,10 @@ cd "$(dirname "$0")"
 ROOT="$(pwd)"
 APP_NAME="AgyHub"
 BUNDLE_ID="local.agyhub.menubar"
-VERSION="${VERSION:-0.1.0}"
+# 版本号的唯一来源是 agyhub-rs/Cargo.toml（App 和内核共用）。
+# 原来默认写死 0.1.0，本地构建的 App 和 GitHub 上的版本永远对不上。
+CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/../agyhub-rs/Cargo.toml" | head -1)"
+VERSION="${VERSION:-$CARGO_VERSION}"
 BUILD_DIR="$ROOT/build"
 APP="$BUILD_DIR/$APP_NAME.app"
 CORE="$ROOT/../agyhub-rs"
@@ -34,7 +37,18 @@ if [ ! -d "$SPARKLE" ]; then
 fi
 
 echo "==> 构建 Rust 内核"
-(cd "$CORE" && cargo build --release)
+# 版本号编进内核：status / doctor / 日志里显示的版本与 App 一致
+(cd "$CORE" && AGYHUB_VERSION="$VERSION" cargo build --release)
+if [ "$("$CORE/target/release/agyhub" --version)" != "agyhub $VERSION" ]; then
+  echo "✗ 内核版本号不对：$("$CORE/target/release/agyhub" --version)，期望 $VERSION"
+  exit 1
+fi
+# 注入页面的脚本必须是合法 JS（include_str! 原样注入，语法错误编译期发现不了）
+if command -v node >/dev/null 2>&1; then
+  for js in "$CORE"/assets/*.js; do
+    node --check "$js" || { echo "✗ $js 有语法错误"; exit 1; }
+  done
+fi
 
 echo "==> 清理旧产物"
 rm -rf "$APP"
@@ -168,7 +182,14 @@ echo
 # 所以直接装到 /Applications 并清掉 build/ 里的副本，只保留一份。
 if [ "${NO_INSTALL:-0}" != "1" ]; then
   echo "==> 安装到 /Applications（保持只有一份）"
+  # 先正常退出旧 App（它退出时会停掉自己的服务），再兜底停一次内核服务
+  osascript -e "tell application id \"$BUNDLE_ID\" to quit" 2>/dev/null || true
+  sleep 1
   pkill -f "/Applications/$APP_NAME.app/Contents/MacOS/$APP_NAME" 2>/dev/null || true
+  # ⚠ 用**刚编出来的**内核去停，不用 /Applications 里的旧内核：
+  # 1.1.0 及以前的内核没有 stop 命令，未知命令会落到默认分支直接起一个网关。
+  # 新内核能认出旧版本起的进程（按配置里的端口 + 进程名），会一起停掉。
+  "$CORE/target/release/agyhub" stop >/dev/null 2>&1 || true
   sleep 0.5
   /bin/rm -rf "/Applications/$APP_NAME.app"
   cp -R "$APP" "/Applications/"

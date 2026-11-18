@@ -27,7 +27,6 @@
 //! - 之后所有命令带上 sessionId
 //! - 命令是请求/响应式的：发 `{id, method, params}`，等 `{id, result}`
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -76,9 +75,13 @@ impl Cdp {
             None => (addr, "/"),
         };
 
-        let mut stream = tokio::net::TcpStream::connect(host_port)
-            .await
-            .map_err(|e| format!("连 CDP 端口失败: {}", e))?;
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(host_port),
+        )
+        .await
+        .map_err(|_| "连 CDP 端口超时".to_string())?
+        .map_err(|e| format!("连 CDP 端口失败: {}", e))?;
 
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -296,6 +299,12 @@ impl Cdp {
     }
 
     /// 在页面里执行 JS，返回结果值。
+    ///
+    /// ⚠️ JS 抛异常时 CDP **不会**返回 error，而是在 result 里带
+    /// `exceptionDetails`。原来没检查这个字段，脚本有语法错误也被当成
+    /// "注入成功"—— SSH 解锁钩子里残留了一个 node 模板占位符
+    /// `${JSON.stringify(TARGET_FLAG)}`，每次都是 SyntaxError，
+    /// 却一直报告"已给 N 个页面装好钩子"。
     pub async fn eval(&mut self, session_id: &str, expr: &str) -> Result<Value, String> {
         let r = self
             .send(
@@ -304,10 +313,27 @@ impl Cdp {
                 Some(session_id),
             )
             .await?;
+        if let Some(ex) = r.get("exceptionDetails") {
+            let desc = ex
+                .get("exception")
+                .and_then(|e| e.get("description"))
+                .and_then(|d| d.as_str())
+                .or_else(|| ex.get("text").and_then(|t| t.as_str()))
+                .unwrap_or("未知异常");
+            let first = desc.lines().next().unwrap_or(desc);
+            return Err(format!("页面脚本异常: {}", first));
+        }
         Ok(r.get("result")
             .and_then(|v| v.get("value"))
             .cloned()
             .unwrap_or(Value::Null))
+    }
+
+    /// 断开某个会话（不影响页面本身）。
+    pub async fn detach(&mut self, session_id: &str) {
+        let _ = self
+            .send("Target.detachFromTarget", json!({ "sessionId": session_id }), None)
+            .await;
     }
 
     /// 刷新页面。
@@ -372,18 +398,9 @@ fn parse_frame(buf: &[u8]) -> Option<(u8, Vec<u8>, usize)> {
 /// 读 Antigravity 的调试端口。
 ///
 /// 每次都要重读：这个端口每次重启应用都会变，缓存会连到旧端口上。
-fn read_debug_port() -> Result<u16, String> {
-    let home = std::env::var("HOME").map_err(|_| "无 HOME".to_string())?;
-    let path = format!(
-        "{}/Library/Application Support/Antigravity/DevToolsActivePort",
-        home
-    );
-    let text =
-        std::fs::read_to_string(&path).map_err(|_| "Antigravity 未运行（读不到调试端口）".to_string())?;
-    text.lines()
-        .next()
-        .and_then(|l| l.trim().parse::<u16>().ok())
-        .ok_or_else(|| "调试端口格式异常".to_string())
+pub fn read_debug_port() -> Result<u16, String> {
+    crate::upstream::devtools_port()
+        .ok_or_else(|| "Antigravity 未运行（读不到调试端口）".to_string())
 }
 
 /// 极简 HTTP GET，返回 JSON 对象。
@@ -413,9 +430,13 @@ async fn http_get(url: &str) -> Result<String, String> {
         None => (rest, "/"),
     };
 
-    let mut stream = tokio::net::TcpStream::connect(host_port)
-        .await
-        .map_err(|e| format!("连接 {} 失败: {}", host_port, e))?;
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(host_port),
+    )
+    .await
+    .map_err(|_| format!("连接 {} 超时", host_port))?
+    .map_err(|e| format!("连接 {} 失败（Antigravity 可能已退出）: {}", host_port, e))?;
 
     let req = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
@@ -485,15 +506,3 @@ pub fn js_json(v: &Value) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "null".into())
 }
 
-/// 供调试用的简易 map-to-json。
-pub fn json_obj(pairs: Vec<(&str, Value)>) -> Value {
-    let mut m = serde_json::Map::new();
-    for (k, v) in pairs {
-        m.insert(k.to_string(), v);
-    }
-    Value::Object(m)
-}
-
-/// 占位，避免未使用告警（HashMap 预留给将来的批量操作）。
-#[allow(dead_code)]
-fn _unused(_: HashMap<String, String>) {}
