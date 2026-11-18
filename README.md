@@ -20,14 +20,14 @@ AgyHub.app
 ### Homebrew（推荐）
 
 ```bash
-brew tap <你的账号>/agyhub
+brew tap cullensu555/agyhub
 brew install --cask agyhub
 ```
 
 ### 一行命令
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/packaging/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/cullensu555/agyhub/main/packaging/install.sh | bash
 ```
 
 ### 手动下载
@@ -123,7 +123,7 @@ cd ../menubar && bash build.sh
 
 # 发版（出 dmg + Sparkle appcast）
 export SU_PUBLIC_KEY=<公钥>
-export SU_FEED_URL=https://github.com/OWNER/REPO/releases/latest/download/appcast-aarch64.xml
+export SU_FEED_URL=https://github.com/cullensu555/agyhub/releases/latest/download/appcast-aarch64.xml
 ./release.sh 1.0.0
 ```
 

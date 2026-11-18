@@ -1,9 +1,9 @@
 # Homebrew Formula 模板
 #
 # 用法：把本文件放到你的 homebrew tap 仓库里
-#   https://github.com/<你>/homebrew-agyhub/Formula/agyhub.rb
+#   https://github.com/cullensu555/homebrew-agyhub/Casks/agyhub.rb
 # 用户就能：
-#   brew tap <你>/agyhub
+#   brew tap cullensu555/agyhub
 #   brew install --cask agyhub     # 或是 brew install agyhub
 #
 # 注意这是 **cask**（图形 App），不是普通 formula。
@@ -13,10 +13,10 @@ cask "agyhub" do
   version "1.0.0"
   sha256 "REPLACE_WITH_SHA256_OF_DMG"
 
-  url "https://github.com/OWNER/REPO/releases/download/v#{version}/AgyHub-#{version}.dmg"
+  url "https://github.com/cullensu555/agyhub/releases/download/v#{version}/AgyHub-#{version}.dmg"
   name "AgyHub"
   desc "Antigravity 手机访问网关（菜单栏 App）"
-  homepage "https://github.com/OWNER/REPO"
+  homepage "https://github.com/cullensu555/agyhub"
 
   # arm64（Apple Silicon）。Intel 机器需另出 x86_64 产物。
   depends_on arch: :arm64

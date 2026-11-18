@@ -3,7 +3,7 @@
 #  AgyHub 一键安装
 #
 #  用法：
-#     curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/packaging/install.sh | bash
+#     curl -fsSL https://raw.githubusercontent.com/cullensu555/agyhub/main/packaging/install.sh | bash
 #
 #  做的事：
 #     1. 检测 CPU 架构（arm64 / x86_64）
@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-REPO="${AGYHUB_REPO:-OWNER/REPO}"
+REPO="${AGYHUB_REPO:-cullensu555/agyhub}"
 APP_NAME="AgyHub"
 INSTALL_DIR="/Applications"
 
