@@ -1,10 +1,10 @@
 # Homebrew Cask
 #
-# 用法：把本文件放到 homebrew tap 仓库里
-#   https://github.com/cullensu555/homebrew-agyhub/Casks/agyhub.rb
-# 用户就能：
-#   brew tap cullensu555/agyhub
-#   brew install --cask agyhub
+# 本仓库本身就是 tap（cask 放在根目录的 Casks/ 下）。用户安装：
+#   brew tap cullensu555/agyhub https://github.com/cullensu555/agyhub
+#   brew install --cask cullensu555/agyhub/agyhub
+#
+# tap 时必须带地址：仓库名不是 homebrew-agyhub，不带地址 brew 找不到。
 #
 # ⚠ version / sha256 由 menubar/release.sh 在发版时自动改写，不要手改。
 cask "agyhub" do
@@ -31,11 +31,17 @@ cask "agyhub" do
                    args: ["-dr", "com.apple.quarantine", "#{appdir}/AgyHub.app"]
   end
 
-  # 卸载前停掉后台服务
+  # 卸载前停掉后台服务。
+  # 先确认内核认识 stop 命令：1.1.0 及以前的内核没有 stop，
+  # 未知命令会直接在前台起一个网关，brew uninstall 就卡住了。
   uninstall quit:   "local.agyhub.menubar",
             script: {
-              executable:   "#{appdir}/AgyHub.app/Contents/Resources/agyhub",
-              args:         ["stop"],
+              executable:   "/bin/sh",
+              args:         [
+                "-c",
+                "K='#{appdir}/AgyHub.app/Contents/Resources/agyhub'; " \
+                "\"$K\" help 2>/dev/null | grep -q stop-web && \"$K\" stop; true",
+              ],
               must_succeed: false,
             }
 

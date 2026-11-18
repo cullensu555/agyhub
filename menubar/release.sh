@@ -171,10 +171,10 @@ XML
 cp "$DMG" "$UPDATE_DIR/"
 
 # 5. 同步 Homebrew cask 的版本号和校验和（cask 里写死的旧值会让 brew 安装直接失败）
-CASK="$ROOT/../packaging/agyhub.rb"
+CASK="$ROOT/../Casks/agyhub.rb"
 if [ -f "$CASK" ]; then
   sed -i '' -E "s/^  version \".*\"/  version \"$VERSION\"/; s/^  sha256 \".*\"/  sha256 \"$SHA256\"/" "$CASK"
-  echo "==> 已更新 packaging/agyhub.rb（version $VERSION, sha256 ${SHA256:0:12}…）"
+  echo "==> 已更新 Casks/agyhub.rb（version $VERSION, sha256 ${SHA256:0:12}…）"
 fi
 
 echo

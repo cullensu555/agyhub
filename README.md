@@ -37,10 +37,17 @@ curl -fsSL https://raw.githubusercontent.com/cullensu555/agyhub/main/packaging/i
 > - 打开「系统设置 → 隐私与安全性」，拉到底部点「仍要打开」
 > - 或在终端执行：`xattr -dr com.apple.quarantine /Applications/AgyHub.app`
 
-### Homebrew（需要先建 tap 仓库）
+### Homebrew
 
-`packaging/agyhub.rb` 是 cask 文件，`release.sh` 发版时会自动更新里面的版本和校验和。
-要让 `brew install --cask` 可用，需要先创建 `cullensu555/homebrew-agyhub` 仓库并把它放进 `Casks/`。
+```bash
+brew tap cullensu555/agyhub https://github.com/cullensu555/agyhub
+brew install --cask cullensu555/agyhub/agyhub
+```
+
+第一行**必须带仓库地址**：本仓库不叫 `homebrew-agyhub`，不带地址的话 brew 会去找一个不存在的仓库。
+装好后 App 自己会通过「检查更新」升级，不需要 `brew upgrade`。
+
+cask 文件在 `Casks/agyhub.rb`，`release.sh` 发版时会自动更新里面的版本号和校验和。
 
 ---
 
