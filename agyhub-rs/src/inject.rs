@@ -642,25 +642,62 @@ const INSTALL_HINT: &str = r#"<style id="agy-install-hint-style">
     var w = (document.body && document.body.clientWidth) || window.innerWidth || 0;
     return w > 0 && w < 640;
   }
-  if (standalone() || !narrow()) { return; }
+  if (standalone()) { return; }
   try { if (localStorage.getItem('__agyHintOff') === '1') { return; } } catch (e) {}
 
+  // 证书是否受信任。
+  //
+  // isSecureContext 是浏览器给的权威判定：
+  //   · true  → 证书链验证通过（系统信任了我们的根 CA）
+  //   · false → 要么没装根证书，要么装了但没设成"信任"
+  //
+  // 用户实测的困惑："安装证书后页面依然提示不安全"。
+  // 原因通常是**装了但没信任** —— macOS/iOS/Android 都要求两步：
+  // 先导入证书，再去设置里把它标成"受信任"。
+  // 所以提示里必须把这一点写清楚，否则用户永远装不对。
   var insecure = !window.isSecureContext;
 
   function mount() {
     if (document.getElementById('agy-hint')) { return; }
     var d = document.createElement('div');
     d.id = 'agy-hint';
-    var msg = insecure
-      ? '<b>证书未受信任，无法安装为应用。</b><br>'
-        + '在手机系统里安装并信任本地根证书：'
-        + '<a href="/__agy/ca.crt" target="_blank" rel="noopener">下载 ca.crt</a>，'
-        + '装好后刷新本页。'
-      : '<b>可以装成应用。</b><br>'
-        + '安卓 Chrome：右上角菜单 →「安装应用 / 添加到主屏幕」；'
-        + 'iPhone Safari：分享 →「添加到主屏幕」。'
-        + '<br><span style="opacity:.65">装完后全屏无地址栏，像原生 App。</span>';
-    d.innerHTML = '<div class="t">' + msg + '</div>'
+
+    // 证书不受信任：不管屏幕宽窄都要显示 ——
+    // 因为这时连 PWA 都装不了，功能实际是残的。
+    // 而"可以装成应用"这种锦上添花的提示只在窄屏（手机）显示。
+    if (insecure) {
+      var mobile = narrow();
+      var msg = '<b>⚠️ 证书未受信任</b><br>'
+        + '这会让页面显示「不安全」，也无法装成应用。'
+        + '<br><br>'
+        + '<b>怎么修：</b><br>'
+        + '1. <a href="/__agy/ca.crt" rel="noopener">下载根证书 ca.crt</a><br>'
+        + '2. 在系统里导入它<br>'
+        + '3. <b>关键一步</b>：去设置里把它设为「信任 / 始终信任」<br>'
+        + '4. 完全关闭浏览器再打开本页<br><br>'
+        + '<span style="opacity:.7;font-size:12px">'
+        + (mobile
+            ? 'iPhone：设置 → 通用 → 关于本机 → 证书信任设置 → 打开开关<br>'
+              + '安卓：设置 → 安全 → 加密与凭据 → 安装证书 → CA 证书'
+            : 'macOS：双击 ca.crt → 钥匙串访问 → 找到证书 → 改为「始终信任」')
+        + '</span>';
+      d.innerHTML = '<div class="t">' + msg + '</div>'
+        + '<button aria-label="关闭">&times;</button>';
+      d.querySelector('button').addEventListener('click', function () {
+        try { localStorage.setItem('__agyHintOff', '1'); } catch (e) {}
+        d.remove();
+      });
+      document.body.appendChild(d);
+      return;
+    }
+
+    // 证书正常：只在手机上提示"可以装成应用"
+    if (!narrow()) { return; }
+    var msg2 = '<b>可以装成应用。</b><br>'
+      + '安卓 Chrome：右上角菜单 →「安装应用 / 添加到主屏幕」；'
+      + 'iPhone Safari：分享 →「添加到主屏幕」。'
+      + '<br><span style="opacity:.65">装完后全屏无地址栏，像原生 App。</span>';
+    d.innerHTML = '<div class="t">' + msg2 + '</div>'
       + '<button aria-label="关闭">&times;</button>';
     d.querySelector('button').addEventListener('click', function () {
       try { localStorage.setItem('__agyHintOff', '1'); } catch (e) {}

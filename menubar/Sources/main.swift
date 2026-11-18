@@ -217,6 +217,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 自动重启的最小间隔（秒）
     let autoStartCooldown: TimeInterval = 20
 
+    /// 启动时把环境信息写进日志。
+    ///
+    /// 用户报问题时，这几行能省掉一半来回问答：
+    /// 版本、系统、内核路径、配置状态。
+    func logEnvironment() {
+        let ver = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        dlog("=== AgyHub \(ver) 启动 ===")
+        dlog("系统: \(ProcessInfo.processInfo.operatingSystemVersionString)")
+        #if arch(arm64)
+        dlog("架构: arm64")
+        #else
+        dlog("架构: x86_64")
+        #endif
+        dlog("App: \(Bundle.main.bundlePath)")
+        dlog("内核: \(corePath() ?? "未找到")")
+        dlog("数据目录: \(NSHomeDirectory())/.agyhub")
+        dlog("初始状态: web(en=\(status.web.enabled) run=\(status.web.running)) "
+           + "ssh(en=\(status.ssh.enabled)) "
+           + "sshWeb(en=\(status.sshWeb.enabled) target=\(status.sshWeb.target ?? "无")) "
+           + "zh(en=\(status.zh.enabled)) ca=\(status.caTrusted)")
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
         refresh()
@@ -226,7 +248,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 判断条件用 status.web.running（而不是「配置里 enabled」）：
         // 用户可能手动停过服务，那种情况不该强行拉起。
         // 只在"确实没在跑"且"配置里是启用状态"时才自动启动。
+        logEnvironment()
         ensureServicesRunning()
+
+        // ---- 自动安装根证书（用户实测反馈：不该让用户手动点）----
+        //
+        // 为什么必须自动：
+        //   不装根证书，手机打开页面会一直显示"不安全"。
+        //   用户不知道"安装证书"是什么意思，也不知道为什么要装 ——
+        //   这是个纯粹的技术细节，不该丢给用户处理。
+        //
+        // 做法：延迟 1.5 秒（等菜单栏图标先出来，避免启动时抢焦点），
+        // 然后调内核 trust-cert。已装过的话内核会直接返回 true，很快。
+        //
+        // 注意：`security add-trusted-cert` 会弹系统密码框，这是 macOS 的
+        // 强制行为，无法绕过。但只在首次需要，之后静默通过。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.autoInstallCertIfNeeded()
+        }
 
         // ---- 需求：登录时自动启动默认勾选 ----
         // 第一次运行时自动注册登录项，尽量少让用户手动操作。
@@ -316,9 +355,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   如果某个服务因为配置错误/端口永久冲突起不来，
     ///   没有退避就会每 3 秒起一次，日志爆炸、CPU 占满。
     func guardServices() {
-        // 只守护「配置里启用」的服务
+        // ---- 本机网页版 ----
+        //
+        // ⚠️ 这里原来**只守护 ssh_web，漏了 web**。
+        //
+        // 后果就是用户实测到的现象：
+        //   打开 App 时服务起来了，过一会儿（内核崩溃/被系统回收/端口冲突）
+        //   就没了，界面变成"未开启"，必须手动再点一次。
+        //   自动守护本该负责这件事，但它压根没检查 web。
+        checkAndRestart(key: "web", enabled: status.web.enabled, running: status.web.running) { [weak self] in
+            self?.startWebService()
+        }
+
+        // ---- SSH 网页版 ----
         checkAndRestart(key: "ssh_web", enabled: status.sshWeb.enabled, running: status.sshWeb.running) { [weak self] in
             self?.startSSHWebService()
+        }
+    }
+
+    /// 只启动本机网页版（不牵扯 SSH）。
+    ///
+    /// 从 `startAll` 里拆出来，是因为守护逻辑需要"只补掉线的那一个"：
+    /// 如果 web 掉了就去调 startAll，会把 SSH 相关也一并重拉，
+    /// 在 SSH 关闭的情况下反而可能弹出不必要的授权框。
+    func startWebService() {
+        guard let core = corePath() else {
+            dlog("startWebService: 找不到内核")
+            return
+        }
+        if let d = runCore(["pick-port", "web"]),
+           let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+           let p = obj["port"] as? Int {
+            port = p
+        }
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: core)
+        p.arguments = ["--port", String(port)]
+
+        let logPath = logURL().path
+        FileManager.default.createFile(atPath: logPath, contents: nil)
+        if let fh = FileHandle(forWritingAtPath: logPath) {
+            fh.seekToEndOfFile()
+            p.standardOutput = fh
+            p.standardError = fh
+        }
+
+        do {
+            try p.run()
+            coreProcess = p
+            dlog("startWebService: 已启动 pid=\(p.processIdentifier) port=\(port)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.refresh()
+            }
+        } catch {
+            dlog("startWebService: 启动失败 \(error)")
         }
     }
 
@@ -359,8 +450,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: 状态刷新
 
     func refresh() {
+        // 记录"状态跳变"而不是每 3 秒都记。
+        //
+        // refresh 每 3 秒跑一次，如果每次都写日志，
+        // 一小时就是 1200 行，真正有用的信息全被冲掉了。
+        // 只在某个服务从 运行↔停止 变化时记一笔，这样日志里
+        // 留下的全是"事件"，用户传日志过来一眼能看到问题在哪。
+        let prevRunning = status.running
+        let prevWeb = status.web.running
+        let prevSSHWeb = status.sshWeb.running
+        let prevCA = status.caTrusted
+
         if let s = fetchStatus(port: port) {
             status = s
+
+            if prevWeb != s.web.running {
+                dlog("状态变化: 网页版 \(prevWeb ? "运行" : "停止") → \(s.web.running ? "运行" : "停止") port=\(s.web.port)")
+            }
+            if prevSSHWeb != s.sshWeb.running {
+                dlog("状态变化: SSH网页版 \(prevSSHWeb ? "运行" : "停止") → \(s.sshWeb.running ? "运行" : "停止") port=\(s.sshWeb.port)")
+            }
+            if prevCA != s.caTrusted {
+                dlog("状态变化: 根证书 \(prevCA ? "已信任" : "未信任") → \(s.caTrusted ? "已信任" : "未信任")")
+            }
+            if prevRunning != s.running {
+                dlog("状态变化: 整体 \(prevRunning ? "运行" : "停止") → \(s.running ? "运行" : "停止")")
+            }
             // ⚠️ 不要在这里把 port 改成 s.web.port。
             //
             // 早期这么写过，导致：用户自定义端口后，下一次 refresh
@@ -368,6 +483,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 端口只有一个真相 —— 内核配置文件。Swift 侧不需要维护副本，
             // 每次启动服务前都重新 pick-port / 读配置即可。
         } else {
+            // 拿不到状态本身是个重要信号（内核崩了/被删了/权限不足），
+            // 但也别每 3 秒刷一次 —— 只在"从有到无"的瞬间记。
+            if prevRunning {
+                dlog("⚠️ 读不到内核状态，切到离线模式（内核可能已退出）")
+            }
             status = .offline(port: port)
         }
         updateIcon()
@@ -481,7 +601,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !status.caTrusted {
             let trust = NSMenuItem(
                 title: "⚠︎ 安装根证书（消除不安全警告）",
-                action: #selector(installCert),
+                action: #selector(installCertFromMenu),
                 keyEquivalent: ""
             )
             trust.target = self
@@ -1039,15 +1159,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: 证书
 
-    @objc func installCert() {
-        guard let core = corePath() else { return }
+    /// 自动安装根证书（仅在尚未安装时）。
+    ///
+    /// 判据优先用内核 `status` 里的 `ca_trusted` 字段：
+    /// 它比直接跑 `security find-certificate` 更可靠，
+    /// 因为内核那边还会检查信任设置（不只是"证书在不在库里"）。
+    func autoInstallCertIfNeeded() {
+        // 已经信任了就什么都不做
+        if status.caTrusted {
+            dlog("autoInstallCert: 已信任，跳过")
+            return
+        }
+        dlog("autoInstallCert: 未信任，开始自动安装")
+        installCert(auto: true)
+    }
+
+    /// 菜单点击入口（无参，供 #selector 使用）。
+    @objc func installCertFromMenu() {
+        installCert(auto: false)
+    }
+
+    /// 安装根证书。
+    ///
+    /// - Parameter auto: 是否由启动流程自动触发（用于区分日志与提示方式）
+    func installCert(auto: Bool) {
+        guard let core = corePath() else {
+            dlog("installCert: 找不到内核")
+            return
+        }
+        dlog("installCert: 开始（auto=\(auto)）")
+
         let p = Process()
         p.executableURL = URL(fileURLWithPath: core)
         p.arguments = ["trust-cert"]
-        try? p.run()
+
+        // 捕获输出，装失败时能说清原因
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+
+        do {
+            try p.run()
+        } catch {
+            dlog("installCert: 启动失败 \(error)")
+            if !auto { alert("安装证书失败", error.localizedDescription) }
+            return
+        }
         p.waitUntilExit()
+
+        let out = String(
+            data: pipe.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        ) ?? ""
+        // 内核的输出逐行写进日志，出问题时用户传日志就能定位
+        for line in out.split(separator: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if !t.isEmpty { dlog("installCert| \(t)") }
+        }
+
+        let ok = p.terminationStatus == 0
+        dlog("installCert: 结束 status=\(p.terminationStatus) 输出长度=\(out.count)")
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            self?.refresh()
+            guard let self else { return }
+            self.refresh()
+            // 自动安装失败才提示（成功就不打扰）
+            if auto && !self.status.caTrusted {
+                self.alert("证书还没装上", """
+                App 尝试自动安装根证书但没成功。
+
+                你可以在菜单里点「安装证书」再试一次，
+                或者在终端里执行：
+
+                  \(core) trust-cert
+
+                装不上会导致手机访问时一直提示"不安全"。
+                """)
+            } else if !auto && ok {
+                self.alert("证书已安装", """
+                根证书已加入钥匙串并设为受信任。
+
+                如果浏览器仍提示不安全，请：
+                  1. 完全退出浏览器再打开
+                  2. 或点「安装证书」并选择 -force 重写信任设置
+
+                手机端需要单独安装一次：
+                在手机上打开 https://电脑IP:\(self.status.web.port)/__agy/ca.crt
+                """)
+            }
         }
     }
 
@@ -1085,8 +1284,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: 其它
 
+    /// 打开日志。
+    ///
+    /// 原来只打开 AgyHub-debug.log 一个文件 —— 但实际日志分散在四个地方：
+    ///   · AgyHub-debug.log    Swift 外壳（服务启停、状态变化）
+    ///   · AgyHub-sshweb.log   SSH 网页版内核（隧道、转发错误）
+    ///   · AgyHub-zh.log       中文注入
+    ///   · AgyHub-boot.log     启动诊断
+    /// 用户点"查看日志"却只看到一个几乎空白的文件，会以为日志坏了。
+    ///
+    /// 现在：先把全部日志汇总成一个带时间线的总览，再用文本编辑器打开。
     @objc func openLog() {
-        NSWorkspace.shared.open(logURL())
+        let agg = aggregateLogs()
+        let url = logURL().deletingLastPathComponent()
+            .appendingPathComponent("AgyHub-all.log")
+        try? agg.write(to: url, atomically: true, encoding: .utf8)
+        NSWorkspace.shared.open(url)
+    }
+
+    /// 把四个日志文件合并成一份带分隔的文本。
+    ///
+    /// 按文件分组而不是按时间穿插：各文件时间戳格式不同
+    /// （Swift 是 ISO8601，内核是 RFC3339 带纳秒），
+    /// 混排反而看不清谁是谁。
+    func aggregateLogs() -> String {
+        let dir = logURL().deletingLastPathComponent()
+        let files = [
+            "AgyHub-debug.log",
+            "AgyHub-sshweb.log",
+            "AgyHub-zh.log",
+            "AgyHub-boot.log",
+        ]
+        var out = """
+        ========================================================
+         AgyHub 日志汇总
+         生成时间：\(Date())
+         系统：\(ProcessInfo.processInfo.operatingSystemVersionString)
+         App 版本：\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?")
+         程序路径：\(Bundle.main.bundlePath)
+        ========================================================
+
+
+        """
+        for name in files {
+            let u = dir.appendingPathComponent(name)
+            out += "---------- \(name) ----------\n"
+            if let txt = try? String(contentsOf: u, encoding: .utf8), !txt.isEmpty {
+                // 只保留最后 2000 行，避免文件过大打不开
+                let lines = txt.split(separator: "\n", omittingEmptySubsequences: false)
+                if lines.count > 2000 {
+                    out += "（文件较大，只显示最后 2000 行）\n"
+                    out += lines.suffix(2000).joined(separator: "\n")
+                } else {
+                    out += txt
+                }
+                if !txt.hasSuffix("\n") { out += "\n" }
+            } else {
+                out += "（文件不存在或为空）\n"
+            }
+            out += "\n\n"
+        }
+        return out
     }
 
     @objc func showAbout() {
