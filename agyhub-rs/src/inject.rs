@@ -79,6 +79,32 @@ pub fn builtin_asset(clean_path: &str, ca_pem: &str) -> Option<Asset> {
     }
 }
 
+// ============================================================
+// App 名称：本机版 Antigravity / SSH 版 Agy SSH
+// ============================================================
+//
+// 两个网页版都装到手机桌面时，名字一样就分不清哪个是本机、哪个是开发机
+// （用户的要求，Python 版就是这么做的，移植到 Rust 时漏掉了）。
+//
+// 影响四处，必须一致：
+//   · manifest 的 name / short_name —— **安卓桌面图标的名字看的是这个**
+//   · <title> 和 document.title    —— 浏览器标签页
+//   · apple-mobile-web-app-title   —— iPhone「添加到主屏幕」的默认名字
+//
+// 模式由启动参数决定（--ssh-target），进程启动后不会变，
+// 但必须在**设置远端上游之后**再取 —— 所以是函数，不是常量。
+
+pub const APP_NAME_LOCAL: &str = "Antigravity";
+pub const APP_NAME_SSH: &str = "Agy SSH";
+
+pub fn app_name() -> &'static str {
+    if crate::upstream::remote_port().is_some() {
+        APP_NAME_SSH
+    } else {
+        APP_NAME_LOCAL
+    }
+}
+
 fn parse_icon_path(p: &str) -> Option<(u32, bool)> {
     let rest = p.strip_prefix("/__agy/icon-")?;
     let rest = rest.strip_suffix(".png")?;
@@ -99,16 +125,29 @@ fn parse_icon_path(p: &str) -> Option<(u32, bool)> {
 ///   name/short_name、start_url、display ∈ {standalone,fullscreen,minimal-ui}、
 ///   icons 含 192 与 512 两档、prefer_related_applications 不为 true
 ///
-/// start_url 用相对 "./"，这样将来多端口也能各开各的，不串档。
+/// ## start_url 必须是 "/"，不能是 "./"
+///
+/// manifest 里的相对地址是**相对 manifest 自己的 URL** 解析的，不是相对页面。
+/// manifest 在 `/__agy/manifest.webmanifest`，所以 "./" 解析出来是 `/__agy/`：
+/// 装到桌面后从图标打开，上游照样返回首页 HTML，但前端路由不认识 `/__agy/`，
+/// 页面只显示一行 "Not found"（用户实测）。
+///
+/// 不同端口本来就是不同的 origin，本机版和 SSH 版装到桌面是两个独立的 App，
+/// 用 "/" 不会串。
 fn manifest_json() -> String {
     let v = icon_version();
+    let name = app_name();
     // 图标 URL 带版本号：WebAPK 把图标固化在本地，URL 不变它就认为
     // "图标没变过"，一直显示旧图。带上版本号 Chrome 才会重新抓。
     serde_json::json!({
-        "name": "Antigravity",
-        "short_name": "Antigravity",
-        "description": "Antigravity 远程界面",
-        "start_url": "./",
+        // id 固定为 "/__agy/"：老版本 manifest 没写 id，Chrome 就用当时的 start_url
+        // （"./" → /__agy/）当身份。保持同一个 id，已经装到桌面的 App 会被 Chrome
+        // 原地更新（新的 start_url、新的名字），而不是被当成另一个 App。
+        "id": "/__agy/",
+        "name": name,
+        "short_name": name,
+        "description": if name == APP_NAME_SSH { "开发机上的 Antigravity（经 SSH）" } else { "Antigravity 远程界面" },
+        "start_url": "/",
         "scope": "/",
         "display": "standalone",
         "display_override": ["standalone", "minimal-ui"],
@@ -518,7 +557,9 @@ fn set_title(html: &str) -> String {
     };
     let mut s = String::with_capacity(html.len());
     s.push_str(&html[..open]);
-    s.push_str("<title>Antigravity</title>");
+    s.push_str("<title>");
+    s.push_str(app_name());
+    s.push_str("</title>");
     s.push_str(&html[close..]);
     s
 }
@@ -534,9 +575,11 @@ fn patch_snippet() -> &'static str {
     static SNIPPET: OnceLock<String> = OnceLock::new();
     SNIPPET.get_or_init(|| {
         let mut s = String::with_capacity(8192);
+        // 名字在拼片段时一次性替换进去（片段只拼一次，模式在进程内不会变）
+        let name = app_name();
         s.push_str(BASE_STYLE);
-        s.push_str(BRANDING_JS);
-        s.push_str(MANIFEST_TAGS);
+        s.push_str(&BRANDING_JS.replace("__AGY_APP_NAME__", name));
+        s.push_str(&MANIFEST_TAGS.replace("__AGY_APP_NAME__", name));
         s.push_str(INSTALL_HINT);
         s.push_str(CLEAN_JS);
         s
@@ -562,7 +605,7 @@ const BASE_STYLE: &str = r#"<style id="agy-mobile-patch">
 const BRANDING_JS: &str = r#"<script>
 (function () {
   var ICON = '/__agy/icon.png';
-  var TITLE = 'Antigravity';
+  var TITLE = '__AGY_APP_NAME__';
   var busy = false;
   function paint() {
     if (busy) { return; }
@@ -602,6 +645,8 @@ const BRANDING_JS: &str = r#"<script>
 //
 // 注意用 r##"..."## ：内容里有 `"#FAF9F5"`，单井号的 raw string 会被 `"#` 提前截断。
 const MANIFEST_TAGS: &str = r##"<link rel="manifest" href="/__agy/manifest.webmanifest">
+<meta name="apple-mobile-web-app-title" content="__AGY_APP_NAME__">
+<meta name="application-name" content="__AGY_APP_NAME__">
 <meta name="theme-color" content="#FAF9F5">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">

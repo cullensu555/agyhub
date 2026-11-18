@@ -286,6 +286,23 @@ async fn handle(
         tracing::info!("{} {}", method, path);
     }
 
+    // ---- 旧版 manifest 的启动地址：跳回首页 ----
+    //
+    // 1.2.0 之前 manifest 的 start_url 是 "./"，相对 manifest 地址解析成 /__agy/，
+    // 装到手机桌面的 App 一打开就是前端的 "Not found"。
+    // 已经装好的那些不用重装：这里直接 302 到 /。
+    if clean_path == "/__agy/" || clean_path == "/__agy" {
+        let query = path.split_once('?').map(|(_, q)| format!("?{}", q)).unwrap_or_default();
+        let resp = Response::builder()
+            .status(StatusCode::FOUND)
+            .header("location", format!("/{}", query))
+            .header("cache-control", "no-store")
+            .body(())?;
+        let mut send = respond.send_response(resp, true)?;
+        let _ = send.send_data(Bytes::new(), true);
+        return Ok(());
+    }
+
     // ---- 内置路由：免口令 ----
     //
     // 必须在鉴权之前拦。favicon 与 manifest 是浏览器自动发起的，
