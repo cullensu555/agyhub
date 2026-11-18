@@ -61,10 +61,22 @@ if [ -z "${SU_FEED_URL:-}" ]; then
   exit 1
 fi
 
-VERSION="$VERSION" SU_PUBLIC_KEY="$SU_PUBLIC_KEY" SU_FEED_URL="$SU_FEED_URL" \
+# ⚠️ 必须带 NO_INSTALL=1
+#
+# build.sh 默认会把产物装到 /Applications 并**删掉 build/ 里的副本**
+# （为了不让聚焦搜索出现两个同名 App）。
+# 但发版要拿 build/AgyHub.app 去打 dmg，删了就没了 ——
+# 表现是 hdiutil 报 "No such file"，最终 release/ 目录空空如也。
+NO_INSTALL=1 VERSION="$VERSION" SU_PUBLIC_KEY="$SU_PUBLIC_KEY" SU_FEED_URL="$SU_FEED_URL" \
   bash "$ROOT/build.sh"
 
 APP="$ROOT/build/AgyHub.app"
+if [ ! -d "$APP" ]; then
+  echo "✗ 构建产物不存在: $APP"
+  echo "  如果 build.sh 已经把它装到 /Applications 并删了 build/，"
+  echo "  说明 NO_INSTALL=1 没传进去。"
+  exit 1
+fi
 mkdir -p "$RELEASE_DIR" "$UPDATE_DIR"
 
 # ---- 1.5 分发前检查：包内不能有外部脚本依赖 ----
@@ -118,7 +130,13 @@ echo "  大小: $SIZE"
 # 4. 生成 appcast
 echo "==> 生成 appcast-aarch64.xml"
 PUBDATE=$(date -u "+%a, %d %b %Y %H:%M:%S +0000")
-DOWNLOAD_URL="${SU_DOWNLOAD_BASE:-https://github.com/OWNER/REPO/releases/download/v$VERSION}/AgyHub-$VERSION.dmg"
+# 默认指向本项目真实仓库。换仓库时用 SU_DOWNLOAD_BASE 覆盖。
+#
+# ⚠️ 这里必须写真实地址：appcast 里这个 URL 是给**已安装用户**做更新用的，
+# 留占位符意味着所有人的自动更新都会 404（而且很难发现，
+# 因为只有"装了旧版的人"才会踩到）。
+DEFAULT_REPO="cullensu555/agyhub"
+DOWNLOAD_URL="${SU_DOWNLOAD_BASE:-https://github.com/$DEFAULT_REPO/releases/download/v$VERSION}/AgyHub-$VERSION.dmg"
 
 cat > "$UPDATE_DIR/appcast-aarch64.xml" <<XML
 <?xml version="1.0" standalone="yes"?>
@@ -146,14 +164,14 @@ cp "$DMG" "$UPDATE_DIR/"
 echo
 echo "✓ 完成"
 echo
-echo "要上传到 GitHub Releases（tag v$VERSION）的文件："
+echo "要上传到 GitHub Releases（tag v${VERSION}）的文件："
 echo "  $UPDATE_DIR/AgyHub-$VERSION.dmg"
 echo "  $UPDATE_DIR/appcast-aarch64.xml"
 echo
 echo "appcast 里的下载地址是："
 echo "  $DOWNLOAD_URL"
-echo "  若仓库不是 OWNER/REPO，用 SU_DOWNLOAD_BASE 覆盖："
-echo "  export SU_DOWNLOAD_BASE=https://github.com/<你>/<仓库>/releases/download/v$VERSION"
+echo "  若仓库不是 $DEFAULT_REPO，用 SU_DOWNLOAD_BASE 覆盖："
+echo "  export SU_DOWNLOAD_BASE=https://github.com/用户名/仓库名/releases/download/v$VERSION"
 echo
 echo "上传后，已安装的旧版本会在下次启动时自动看到更新。"
 echo

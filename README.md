@@ -110,24 +110,136 @@ agyhub doctor              # 自检
 
 ---
 
-## 从源码构建
+## 开发环境
 
-需要 Rust 1.75+ 和 Xcode Command Line Tools。
+### 必需
+
+| 工具 | 版本要求 | 用途 | 获取方式 |
+|---|---|---|---|
+| **Xcode** | 15+ | 编译 Swift 外壳、提供 macOS SDK | App Store 搜「Xcode」 |
+| **Xcode Command Line Tools** | — | `swiftc`、`codesign`、`ditto`、`hdiutil` | `xcode-select --install` |
+| **Rust** | 1.75+ | 编译内核 | 见下方 |
+| **Git** | — | 版本控制 | `xcode-select --install` 自带 |
+
+> 本项目在 **Rust 1.100 / Swift 6.4 / macOS 26** 上验证通过。
+> 版本门槛来自依赖：`rustls 0.23` 要求 Rust 1.71+，`h2 0.4` 要求 1.63+。
+
+### 安装 Rust
 
 ```bash
-# 内核
-cd agyhub-rs && cargo build --release
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+```
 
-# App（会自动把内核拷进去）
-cd ../menubar && bash build.sh
+**不要用 `brew install rust`** —— Homebrew 版本经常落后，且升级时可能
+静默换掉工具链，导致 `cargo build` 突然报奇怪的错误。
 
-# 发版（出 dmg + Sparkle appcast）
-export SU_PUBLIC_KEY=<公钥>
+### 可选（只有发版才需要）
+
+| 工具 | 用途 | 获取方式 |
+|---|---|---|
+| **Sparkle** 2.x | 自动更新框架 + 签名/appcast 工具 | 见下方 |
+| **GitHub CLI**（`gh`） | 命令行创建 release、上传产物 | `brew install gh` |
+
+#### 获取 Sparkle
+
+`release.sh` 需要 Sparkle 的四个命令行工具：
+`generate_keys`、`sign_update`、`generate_appcast`、`BinaryDelta`。
+
+它们**不在版本库里**（107MB，且能从官网重下）。手动准备：
+
+```bash
+cd menubar
+# 下载（换成你需要的版本）
+curl -L -o sparkle.tar.xz \
+  https://github.com/sparkle-project/Sparkle/releases/download/2.10.1/Sparkle-2.10.1.tar.xz
+
+mkdir -p vendor && tar -xJf sparkle.tar.xz -C vendor
+# 解压后应能看到 vendor/bin/ 和 vendor/Sparkle.framework/
+ls vendor/bin
+```
+
+> 版本号必须与 `build.sh` 里拷贝的 `Sparkle.framework` 一致，
+> 否则签名验不过。本项目用的是 **2.10.1**。
+
+---
+
+## 从源码构建
+
+```bash
+# 1. 内核
+cd agyhub-rs
+cargo build --release
+# 产物 target/release/agyhub（约 2.8MB）
+
+# 2. App（会自动把内核拷进去）
+cd ../menubar
+bash build.sh
+# 产物 build/AgyHub.app，同时装到 /Applications/
+```
+
+只想用不想开发的话，`bash build.sh` 一条命令就够 —— 它会先检查内核是否
+需要重编。
+
+### 发版
+
+```bash
+cd menubar
+
+# 首次：生成签名的密钥对（只做一次）
+# 私钥存进登录钥匙串（account: agyhub），公钥会打印出来
+./release.sh --init-keys
+
+# 发版
+export SU_PUBLIC_KEY=<上一步打印的公钥>
 export SU_FEED_URL=https://github.com/cullensu555/agyhub/releases/latest/download/appcast-aarch64.xml
 ./release.sh 1.0.0
 ```
 
-`release.sh` 会检查包内**不能有 `.py`/`.cjs`/`.js`** —— 这是"能不能发给别人用"的硬门槛。
+产出：
+
+```
+menubar/release/AgyHub-1.0.0.dmg      分发包
+menubar/update/appcast-aarch64.xml    自动更新的索引
+```
+
+`release.sh` 会做一道**硬门槛检查**：包内不能有 `.py`/`.cjs`/`.js`。
+这是"能不能发给别人用"的底线 —— 一旦发现就 `exit 1`。
+
+### 上传到 GitHub
+
+```bash
+gh release create v1.0.0 \
+  menubar/release/AgyHub-1.0.0.dmg \
+  menubar/update/appcast-aarch64.xml \
+  --title "AgyHub 1.0.0" \
+  --notes "首个公开版本"
+```
+
+没有 `gh` 的话去网页操作：仓库 → Releases → Draft a new release，
+tag 填 `v1.0.0`，把两个文件拖进去。
+
+> ⚠️ **tag 名必须是 `v1.0.0`（带 v）**，因为 appcast 和 Homebrew 里的
+> 下载地址都是按 `/releases/download/v1.0.0/` 拼的。
+
+---
+
+## 常见问题
+
+**构建报「找不到 agyhub」**
+先跑 `cargo build --release`。`build.sh` 会从 `../agyhub-rs/target/release/`
+找内核，没有就失败。
+
+**`release.sh` 报「签名失败」**
+钥匙串里没有私钥。跑 `./release.sh --init-keys` 生成；
+如果已经有但换了机器，私钥没法迁移，只能重新生成（老用户需要重装一次）。
+
+**App 打开后菜单栏没图标**
+看 `~/Library/Logs/AgyHub-debug.log`。常见原因是内核没打包进去。
+
+**改了 Rust 代码但行为没变**
+`build.sh` 不会自动重编内核。先 `cargo build --release` 再 `bash build.sh`。
+判断办法：`cmp agyhub-rs/target/release/agyhub /Applications/AgyHub.app/Contents/Resources/agyhub`。
 
 ---
 
