@@ -16,9 +16,11 @@ cask "agyhub" do
   desc "Antigravity 手机访问网关（菜单栏 App）"
   homepage "https://github.com/cullensu555/agyhub"
 
-  # 只有 Apple Silicon（arm64）版本
+  # auto_updates：App 自己通过 Sparkle 更新，brew upgrade 默认不和它抢。
+  # depends_on：只有 Apple Silicon（arm64）版本。
+  auto_updates true
   depends_on arch: :arm64
-  depends_on macos: ">= :ventura"
+  depends_on macos: :ventura
 
   app "AgyHub.app"
 
