@@ -208,7 +208,7 @@ echo "  $UPDATE_DIR/appcast-aarch64.xml"
 echo
 echo "appcast 里的下载地址是："
 echo "  $DOWNLOAD_URL"
-echo "  若仓库不是 $DEFAULT_REPO，用 SU_DOWNLOAD_BASE 覆盖："
+echo "  若仓库不是 ${DEFAULT_REPO}，用 SU_DOWNLOAD_BASE 覆盖："
 echo "  export SU_DOWNLOAD_BASE=https://github.com/用户名/仓库名/releases/download/v$VERSION"
 echo
 echo "上传后，已安装的旧版本会在下次启动时自动看到更新。"
