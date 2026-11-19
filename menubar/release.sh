@@ -193,7 +193,9 @@ cp "$DMG" "$UPDATE_DIR/"
 # 5. 同步 Homebrew cask 的版本号和校验和（cask 里写死的旧值会让 brew 安装直接失败）
 CASK="$ROOT/../Casks/agyhub.rb"
 if [ -f "$CASK" ]; then
-  sed -i '' -E "s/^  version \".*\"/  version \"$VERSION\"/; s/^  sha256 \".*\"/  sha256 \"$SHA256\"/" "$CASK"
+  # 用绝对路径：PATH 里的 sed 可能被换成别的实现（如 toybox），不认 BSD 的 `-i ''`，
+  # 会把表达式当成文件名报错，cask 就悄悄没更新（1.2.2 发版时踩过）
+  /usr/bin/sed -i '' -E "s/^  version \".*\"/  version \"$VERSION\"/; s/^  sha256 \".*\"/  sha256 \"$SHA256\"/" "$CASK"
   echo "==> 已更新 Casks/agyhub.rb（version $VERSION, sha256 ${SHA256:0:12}…）"
 fi
 
