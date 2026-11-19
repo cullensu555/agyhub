@@ -40,6 +40,15 @@ pub struct RemoteTunnel {
     pub local_port: u16,
     /// 远端 language_server 的实际端口
     pub remote_port: u16,
+    /// 远端 language_server 的主 CSRF 口令（取不到时为空）。
+    ///
+    /// 2.33.0 起桌面版经官方 SSH 部署的远端服务带
+    /// `AGY_REQUIRE_AUTHENTICATED_UI_BOOTSTRAP=1` 启动：首页里的
+    /// `__APP_CONFIG__.csrfToken` 被置空，页面要先拿一次性令牌（`#t=`）
+    /// 去 `/auth` 换会话口令。那个令牌只有桌面版主进程能签发，
+    /// 浏览器经网关打开时什么口令都没有 → 前端报 "Missing LS CSRF token"，白屏。
+    /// 所以由网关把主口令填回首页（等同旧版服务把口令直接写在页面里）。
+    pub csrf_token: String,
     /// `ssh -N` 子进程
     proc: Option<Child>,
     /// 日志回调
@@ -52,6 +61,7 @@ impl RemoteTunnel {
             target: target.to_string(),
             local_port,
             remote_port: 0,
+            csrf_token: String::new(),
             proc: None,
             log: Box::new(|_| {}),
         }
@@ -71,7 +81,7 @@ impl RemoteTunnel {
 
     /// 建立隧道：发现远端端口 → 逐个试映射 → 找到 HTTP 上游后固定下来。
     pub fn start(&mut self) -> io::Result<()> {
-        let candidates = self.discover_remote_ports()?;
+        let (candidates, tokens) = self.discover_remote_ports()?;
         self.say(&format!(
             "远端 {} 候选端口: {:?}",
             self.target, candidates
@@ -118,9 +128,17 @@ impl RemoteTunnel {
                         self.proc = Some(proc);
                         self.local_port = local;
                         self.remote_port = *rp;
+                        self.csrf_token = tokens
+                            .iter()
+                            .find(|(p, _)| p == rp)
+                            .map(|(_, t)| t.clone())
+                            .unwrap_or_default();
                         self.say(&format!(
-                            "隧道就绪 127.0.0.1:{} → {}:{}（明文 HTTP）",
-                            local, self.target, rp
+                            "隧道就绪 127.0.0.1:{} → {}:{}（明文 HTTP，{}）",
+                            local,
+                            self.target,
+                            rp,
+                            if self.csrf_token.is_empty() { "未取到远端口令" } else { "已取到远端口令" }
                         ));
                         return Ok(());
                     }
@@ -149,8 +167,18 @@ impl RemoteTunnel {
     /// 远端启动参数是 `--https_server_port 0 / --http_server_port 0`，
     /// 即**随机端口**，必须扫。这里只返回候选，实际判定由 `open_forward`
     /// 之后的 `probe_http` 完成（要区分 HTTP 和 HTTPS）。
-    fn discover_remote_ports(&self) -> io::Result<Vec<u16>> {
-        let out = self.ssh_run("ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null")?;
+    fn discover_remote_ports(&self) -> io::Result<(Vec<u16>, Vec<(u16, String)>)> {
+        // 同一条 ssh 顺带读出 discovery 文件（端口 → 主口令），省一次完整握手。
+        // 文件由远端 language_server 自己写，权限 600，只有本账号能读。
+        let out = self.ssh_run(&format!(
+            "ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null; echo '{}'; \
+             for f in ~/.gemini/antigravity/daemon/ls_*.json; do [ -f \"$f\" ] && cat \"$f\"; echo; done",
+            DISCOVERY_MARK
+        ))?;
+        let (out, tokens) = match out.split_once(DISCOVERY_MARK) {
+            Some((ss, disc)) => (ss.to_string(), parse_discovery(disc)),
+            None => (out, Vec::new()),
+        };
         if out.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -190,7 +218,7 @@ impl RemoteTunnel {
         }
 
         ports.sort_unstable();
-        Ok(ports)
+        Ok((ports, tokens))
     }
 
     /// 在远端执行命令，返回 stdout。
@@ -292,7 +320,11 @@ impl RemoteTunnel {
     pub fn alive(&self) -> bool {
         match &self.proc {
             None => false,
-            Some(_) => probe_http(self.local_port),
+            // 守护探测用长超时：探测和页面请求走同一条 ssh 连接，
+            // 页面下载大文件（2.33.0 的 main.js 12MB，跨境链路要几十秒）时
+            // 探测请求会排在后面。2 秒超时会连续判失败 → 重连 → 杀掉复用连接，
+            // 正在下载的 main.js 被截断，页面白屏（实测断在 6.8/7.8/9.9MB）。
+            Some(_) => probe_http_timeout(self.local_port, ALIVE_PROBE_TIMEOUT),
         }
     }
 
@@ -422,6 +454,34 @@ fn control_path() -> String {
     format!("{}/agyhub-%C", control_dir())
 }
 
+/// 远端命令输出里分隔「端口列表」和「discovery 文件」的标记。
+const DISCOVERY_MARK: &str = "---agyhub-discovery---";
+
+/// 从远端 discovery 文件（多个拼在一起的 JSON 对象，带缩进换行：
+/// `{"httpPort":…,"csrfToken":"…"}`）里取出「HTTP 端口 → 主口令」。
+/// 解析不了就到此为止：旧版远端没有这个目录，或字段改名，
+/// 都退回到不填口令（即旧行为）。
+fn parse_discovery(text: &str) -> Vec<(u16, String)> {
+    let mut out = Vec::new();
+    let stream = serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>();
+    for v in stream {
+        let v = match v {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        let port = v.get("httpPort").and_then(|p| p.as_u64()).unwrap_or(0);
+        let token = v.get("csrfToken").and_then(|t| t.as_str()).unwrap_or("");
+        // 口令只允许 UUID 那类字符：它要原样拼进页面的 JS 里，不能带引号等。
+        let safe = !token.is_empty()
+            && token.len() <= 128
+            && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if port > 0 && port <= u16::MAX as u64 && safe {
+            out.push((port as u16, token.to_string()));
+        }
+    }
+    out
+}
+
 /// 挑一个空闲的本地端口。
 fn pick_free_port() -> io::Result<u16> {
     let l = TcpListener::bind("127.0.0.1:0")?;
@@ -435,6 +495,13 @@ fn pick_free_port() -> io::Result<u16> {
 /// 判据是响应里有 `csrfToken`：Antigravity 首页的
 /// `__APP_CONFIG__` 里带这个字段，别的东西碰巧占这个端口不会有。
 fn probe_http(port: u16) -> bool {
+    probe_http_timeout(port, Duration::from_secs(2))
+}
+
+/// 隧道守护的存活探测超时（见 [`RemoteTunnel::alive`]）。
+const ALIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn probe_http_timeout(port: u16, timeout: Duration) -> bool {
     use std::io::{Read, Write};
 
     let addr = match format!("127.0.0.1:{}", port).parse() {
@@ -442,12 +509,12 @@ fn probe_http(port: u16) -> bool {
         Err(_) => return false,
     };
 
-    let mut s = match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+    let mut s = match TcpStream::connect_timeout(&addr, timeout) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-    let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
+    let _ = s.set_read_timeout(Some(timeout));
+    let _ = s.set_write_timeout(Some(timeout));
 
     let req = format!(
         "GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",

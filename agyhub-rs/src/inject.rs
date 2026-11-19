@@ -521,6 +521,7 @@ pub fn patch_html(html: &str) -> String {
 
     // 标题先在服务端钉一次：先于任何 JS 执行，避免标签页闪一下旧名字。
     let html = set_title(html);
+    let html = fill_remote_csrf(&html);
 
     // 注入点必须在 </head> 之前，但匹配要**不区分大小写**：
     // 上游模板用的是小写，将来若改风格不能因此失效。
@@ -542,6 +543,29 @@ pub fn patch_html(html: &str) -> String {
     out.push_str(&html);
     out.push_str(&patch);
     out
+}
+
+/// SSH 模式：远端首页口令被置空时，把隧道取到的主口令填回去。
+///
+/// 2.33.0 起官方 SSH 部署的远端服务开了「UI 一次性令牌」：首页
+/// `__APP_CONFIG__.csrfToken` 为空，只有带 `#t=` 令牌打开才能换到会话口令，
+/// 而令牌只有桌面版主进程能签发。网关打开的页面拿不到任何口令，
+/// 前端抛 "Missing LS CSRF token cookie"，整页白屏。
+///
+/// 填回主口令后，页面行为等同旧版远端服务（口令本来就直接写在首页里）。
+/// 能看到这个页面的人已经过了网关口令，不扩大暴露面。
+/// 前端定期 `fetch(location.href)` 重读口令，也经过这里，所以一直有效。
+/// 本机模式、或远端首页本来就带口令时不改。
+fn fill_remote_csrf(html: &str) -> String {
+    const EMPTY: &str = "\"csrfToken\":\"\"";
+    if crate::upstream::remote_port().is_none() || !html.contains(EMPTY) {
+        return html.to_string();
+    }
+    let token = crate::upstream::remote_csrf();
+    if token.is_empty() {
+        return html.to_string();
+    }
+    html.replacen(EMPTY, &format!("\"csrfToken\":\"{}\"", token), 1)
 }
 
 /// 把 <title> 换成 App 名字。

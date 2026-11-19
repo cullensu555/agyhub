@@ -186,6 +186,18 @@ pub fn remote_port() -> Option<u16> {
     }
 }
 
+/// 远端 language_server 的主 CSRF 口令（见 `tunnel::RemoteTunnel::csrf_token`）。
+/// 隧道每次（重）连时更新：远端服务重启后口令会变。
+static REMOTE_CSRF: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+pub fn set_remote_csrf(token: &str) {
+    *REMOTE_CSRF.lock().unwrap() = token.to_string();
+}
+
+pub fn remote_csrf() -> String {
+    REMOTE_CSRF.lock().unwrap().clone()
+}
+
 pub fn find_upstream(force: bool) -> Option<u16> {
     // 远端模式：上游固定，直接返回。
     //

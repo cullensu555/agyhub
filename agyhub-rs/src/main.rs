@@ -1344,6 +1344,7 @@ async fn run(port_arg: Option<u16>, ssh_target: Option<String>) {
             Err(e) => run_fail(kind, me, format!("隧道线程异常: {}", e)),
         };
         tracing::info!("上游（远端）: 127.0.0.1:{}", t.local_port);
+        upstream::set_remote_csrf(&t.csrf_token);
         upstream::set_remote(t.local_port);
 
         // 隧道守护：端到端探测连续失败 3 次（约 30 秒）才重连。
@@ -1371,6 +1372,7 @@ async fn run(port_arg: Option<u16>, ssh_target: Option<String>) {
                 tracing::warn!("隧道不可用（连续 {} 次探测失败），尝试重连", fails);
                 match t.start() {
                     Ok(()) => {
+                        upstream::set_remote_csrf(&t.csrf_token);
                         upstream::set_remote(t.local_port);
                         state::clear_error(Kind::SshWeb);
                         tracing::info!("隧道已重连 → 127.0.0.1:{}", t.local_port);
