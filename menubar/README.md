@@ -153,8 +153,24 @@ export SU_DOWNLOAD_BASE="https://github.com/<你>/<仓库>/releases/download/v0.
 - `AgyHub-0.2.0.dmg`
 - `appcast-aarch64.xml`（含 EdDSA 签名）
 
-把这两个文件上传到 GitHub Releases（tag 用 `v0.2.0`），已安装的旧版本
+把这两个文件上传到 GitHub Releases（tag 用 `v0.2.0`，标题用 `AgyHub 0.2.0`），已安装的旧版本
 下次启动就能看到更新。
+
+Release 说明的固定格式：
+
+```markdown
+## 0.2.0：一句话主题
+
+**修复**
+- 用户看到的现象（必要时缩进写原因或怎么恢复）
+
+**新增** / **变化**（没有就不写）
+- …
+
+已安装旧版本的：菜单「检查更新…」即可升级。
+```
+
+小版本只有一两条修复时标题可以只写 `## 0.2.0`；大版本在升级提示前加「**安装**」命令块。
 
 ### 更新机制细节
 
