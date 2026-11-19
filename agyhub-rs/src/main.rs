@@ -63,7 +63,7 @@ fn main() {
         "run", "status", "doctor", "trust-cert", "rotate-token",
         "set-enabled", "set-port", "pick-port",
         "ssh-hosts", "start-ssh-web", "stop-ssh-web", "start-web", "stop-web", "stop",
-        "zh", "ssh-unlock", "ensure-inject", "help", "version",
+        "zh", "ssh-unlock", "ensure-inject", "relaunch-antigravity", "help", "version",
     ];
     // 带值的开关：值要一起跳过，否则 `--target status` 里的 status 会被当成子命令
     let valued_flags = ["--port", "--target", "--ssh-target", "--wait"];
@@ -123,6 +123,11 @@ fn main() {
         "zh" => toggle_zh(&args),
         "ssh-unlock" => cmd_ssh_unlock(&args),
         "ensure-inject" => ensure_inject_cmd(&args),
+        // 只由用户在菜单里点击触发；守护逻辑永远不调它（会打断正在跑的 agent）
+        "relaunch-antigravity" => match inject::relaunch_with_debug_port() {
+            Ok(msg) => println!("{}", json!({ "ok": true, "message": msg })),
+            Err(e) => println!("{}", json!({ "ok": false, "error": e })),
+        },
         "start-web" => println!("{}", start_web()),
         "stop-web" => println!("{}", stop_cmd(&[Kind::Web])),
         "start-ssh-web" => println!("{}", start_ssh_web(&args)),
@@ -203,6 +208,7 @@ fn usage() {
            agyhub ssh-hosts               列出 ~/.ssh/config 里的主机\n  \
            agyhub zh on|off               桌面版中文界面\n  \
            agyhub ssh-unlock [off]        桌面版 SSH 入口\n  \
+           agyhub relaunch-antigravity    带调试端口重新打开 Antigravity（中文界面需要）\n  \
            agyhub trust-cert [--force]    把根证书装进钥匙串\n  \
            agyhub rotate-token            更换访问口令（立即生效）\n  \
            agyhub doctor                  环境自检\n\n\
@@ -289,11 +295,18 @@ fn status() {
     // 结果够新（60 秒内）且 Antigravity 没重启过（调试端口没变）才算数。
     // 原来这里 pgrep 一个早已废弃的 node 脚本，于是 SSH 永远显示"未运行"。
     let devtools = upstream::devtools_port();
+    let devtools_ok = ag_running && upstream::devtools_ok();
+    // 2.33.0 起官方开放了 SSH：服务端开关已打开时不需要注入，直接算生效
+    let ssh_official = ag_running && upstream::ssh_official(upstream_port) == Some(true);
     let inj = state::inject_load();
     let fresh = ag_running && state::inject_fresh(&inj, devtools);
-    let ssh_running = cfg.ssh_enabled && fresh && inj.ssh && inj.ssh_active;
+    let ssh_running = cfg.ssh_enabled && (ssh_official || (fresh && inj.ssh && inj.ssh_active));
     let zh_running = cfg.zh_enabled && fresh && inj.zh;
-    let ssh_pending = cfg.ssh_enabled && fresh && inj.ssh && !inj.ssh_active;
+    let ssh_pending = cfg.ssh_enabled && !ssh_official && fresh && inj.ssh && !inj.ssh_active;
+    // 需要注入、但 Antigravity 没开调试端口 → 只能带参数重开一次
+    let need_relaunch = ag_running
+        && !devtools_ok
+        && ((cfg.zh_enabled && !zh_running) || (cfg.ssh_enabled && !ssh_running));
     let inject_detail = |enabled: bool, running: bool, ok_text: &str| -> String {
         if !enabled {
             String::new()
@@ -301,6 +314,10 @@ fn status() {
             "等待 Antigravity 打开".into()
         } else if running {
             ok_text.into()
+        } else if !devtools_ok {
+            // 2.33.0 起不带参数启动就没有调试端口，注入做不了。
+            // 原来这里会落到"正在生效…"，用户看不出卡在哪。
+            "Antigravity 没开调试端口，需要用下面的按钮重新打开一次".into()
         } else if ok_text == "已解锁" && ssh_pending {
             "已就绪 · 在 Antigravity 里切换一次对话后出现".into()
         } else if fresh && !inj.error.is_empty() {
@@ -309,6 +326,7 @@ fn status() {
             "正在生效…".into()
         }
     };
+    let ssh_ok_text = if ssh_official { "官方已开放" } else { "已解锁" };
 
     let obj = json!({
         "version": VERSION,
@@ -320,7 +338,14 @@ fn status() {
 
         "upstream_ok": upstream_port.is_some(),
         "upstream_port": upstream_port.unwrap_or(0),
-        "antigravity": { "installed": ag_installed, "running": ag_running },
+        "antigravity": {
+            "installed": ag_installed,
+            "running": ag_running,
+            // 调试端口是否可用（桌面版注入的前提）
+            "debug_port": devtools_ok,
+            // 有开着的注入功能因为没调试端口而做不了 → 菜单显示「重新打开」按钮
+            "need_relaunch": need_relaunch,
+        },
         "lan_ip": lan_ip,
         "token": token,
         "ca_trusted": ca_trusted,
@@ -346,7 +371,9 @@ fn status() {
             "preferred_port": 0,
             "pid": 0,
             "url": "",
-            "detail": inject_detail(cfg.ssh_enabled, ssh_running, "已解锁"),
+            // 官方已开放 SSH：不再注入，菜单文案相应改变
+            "official": ssh_official,
+            "detail": inject_detail(cfg.ssh_enabled, ssh_running, ssh_ok_text),
         },
         "ssh_web": {
             "enabled": cfg.ssh_web_enabled,
@@ -795,6 +822,20 @@ fn current_thread_rt() -> Result<tokio::runtime::Runtime, String> {
         .map_err(|e| format!("创建运行时失败: {}", e))
 }
 
+/// 桌面版 SSH 入口是否还需要我们注入钩子。
+///
+/// 2.33.0 起官方正式开放了 SSH（服务端开关不再带 disabled），
+/// 这时再注入只会白白刷新一次窗口。
+///
+/// ⚠️ 只有**明确查到开关还关着**才注入。查不到（None）时这一轮先不注入：
+/// 实测 Antigravity 刚重开的几秒里 language_server 还没起来，查不到开关，
+/// 原来按"查不到就注入"处理，结果在官方已开放的版本上也注入并多刷新了一次窗口。
+/// 老版本（开关带 disabled）同一个接口能查到 Some(false)，照样会注入；
+/// 接口要是真没了，钩子拦的就是这个接口，注入也没用。
+fn ssh_hook_needed(cfg: &config::Config) -> bool {
+    cfg.ssh_enabled && upstream::ssh_official(upstream::find_upstream(false)) == Some(false)
+}
+
 /// 巡检桌面版注入（App 每隔几秒调用一次）。
 ///
 /// `--force-ssh-reload`：允许为装 SSH 钩子刷新页面（用户刚打开开关时）。
@@ -802,7 +843,8 @@ fn ensure_inject_cmd(args: &[String]) {
     // 先拿锁再读配置：等锁期间用户可能刚关掉了中文
     let _lock = inject_lock();
     let cfg = config::Config::load();
-    if !cfg.zh_enabled && !cfg.ssh_enabled {
+    let want_ssh = ssh_hook_needed(&cfg);
+    if !cfg.zh_enabled && !want_ssh {
         println!("{}", json!({ "ok": true, "skipped": true }));
         return;
     }
@@ -817,7 +859,7 @@ fn ensure_inject_cmd(args: &[String]) {
     let res = rt.block_on(async {
         tokio::time::timeout(
             Duration::from_secs(40),
-            actions::ensure_injected(cfg.zh_enabled, cfg.ssh_enabled, force),
+            actions::ensure_injected(cfg.zh_enabled, want_ssh, force),
         )
         .await
         .unwrap_or_else(|_| Err("巡检超时".into()))
@@ -860,6 +902,20 @@ fn cmd_ssh_unlock(args: &[String]) {
             // Antigravity 没开也算关闭成功：下次打开时不会再注入
             Err(e) => println!("{}", json!({ "ok": true, "enabled": false, "message": e })),
         }
+        return;
+    }
+
+    // 没查到"开关还关着"：开关只记在配置里，不注入、不刷新窗口。
+    // 官方已开放时是真生效；暂时查不到（Antigravity 刚启动）时巡检会在查到 Some(false) 后补上。
+    if !ssh_hook_needed(&cfg) {
+        let official = upstream::ssh_official(upstream::find_upstream(false)) == Some(true);
+        println!(
+            "{}",
+            json!({
+                "ok": true, "enabled": true, "running": official, "official": official,
+                "message": if official { "官方已开放 SSH 入口，不需要注入" } else { "已记下，Antigravity 就绪后自动生效" },
+            })
+        );
         return;
     }
 
@@ -925,7 +981,7 @@ fn toggle_zh(args: &[String]) {
 
             let mut restored = false;
             if let Ok(rt) = current_thread_rt() {
-                if let Ok(msg) = rt.block_on(actions::restore_zh_ui(cfg.ssh_enabled)) {
+                if let Ok(msg) = rt.block_on(actions::restore_zh_ui(ssh_hook_needed(&cfg))) {
                     tracing::info!("还原界面: {}", msg);
                     restored = true;
                 }
@@ -954,7 +1010,7 @@ fn toggle_zh(args: &[String]) {
             let res = rt.block_on(async {
                 tokio::time::timeout(
                     Duration::from_secs(40),
-                    actions::ensure_injected(true, cfg.ssh_enabled, false),
+                    actions::ensure_injected(true, ssh_hook_needed(&cfg), false),
                 )
                 .await
                 .unwrap_or_else(|_| Err("注入超时".into()))

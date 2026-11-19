@@ -66,8 +66,8 @@ cask 文件在 `Casks/agyhub.rb`，`release.sh` 发版时会自动更新里面�
 |---|---|---|
 | **本机网页版** | 手机访问你这台 Mac 上的 Antigravity（默认开启） | 无 |
 | **SSH 网页版** | 手机访问**开发机**的完整界面 | 配好 `~/.ssh/config` + 密钥免密 |
-| **桌面版 SSH 入口** | 让电脑上的 Antigravity 出现「Connect to SSH Host…」 | 打开时 Antigravity 窗口会刷新一次 |
-| **中文界面（桌面版）** | 电脑上的 Antigravity 显示中文，重启后自动恢复 | 无 |
+| **桌面版 SSH 入口** | 让电脑上的 Antigravity 出现「Connect to SSH Host…」 | Antigravity 2.33.0 起官方已开放，不再注入；更早的版本打开时窗口会刷新一次 |
+| **中文界面（桌面版）** | 电脑上的 Antigravity 显示中文，重启后自动恢复 | 需要 Antigravity 开着调试端口。2.33.0 起，从程序坞打开或自动更新重启后不会开，菜单里会出现「重新打开 Antigravity」，点一下即可 |
 
 每个服务下面有：链接（点击在本机打开）、复制链接、显示二维码、端口。
 启动失败时，原因直接显示在菜单里，点击可以看完整说明。
@@ -127,6 +127,7 @@ $A stop                          # 停止全部服务
 $A ssh-hosts                     # 列出 ~/.ssh/config 里的主机（支持 Include）
 $A zh on|off                     # 桌面版中文界面
 $A ssh-unlock [off]              # 桌面版 SSH 入口
+$A relaunch-antigravity          # 带调试端口重新打开 Antigravity（中文界面需要）
 $A trust-cert                    # 安装根证书
 $A rotate-token                  # 更换访问口令（立即生效，不用重启）
 $A doctor                        # 自检：Antigravity、证书、端口、服务、上次失败原因

@@ -891,10 +891,94 @@ pub fn antigravity_installed() -> bool {
 /// 用 proc_listallpids + proc_pidpath 直接问内核，不调 pgrep/ps
 /// （这两个在某些管控环境下会被拦截）。
 pub fn antigravity_running() -> bool {
-    !crate::sys::find_pids(|p| {
+    !antigravity_pids().is_empty()
+}
+
+fn antigravity_pids() -> Vec<u32> {
+    crate::sys::find_pids(|p| {
         p.ends_with(".app/Contents/MacOS/Antigravity") && p.contains("Antigravity")
     })
-    .is_empty()
+}
+
+/// 退出 Antigravity，再带着调试端口重新打开。只由用户在菜单里点击触发。
+///
+/// ## 为什么需要
+///
+/// 2.33.0 起只有带 `--remote-debugging-port` 启动才有调试端口，桌面版中文注入靠它。
+/// macOS 没有给 App 设"默认启动参数"的办法（改 App 包会破坏签名、更新也会覆盖），
+/// 所以从程序坞打开或自动更新重启后，只能这样重开一次。
+///
+/// ## 怎么退出
+///
+/// 发 SIGTERM，不用 AppleScript `quit`：
+///   · Electron 收到 SIGTERM 会走正常的 app.quit()（触发 before-quit，会保存状态）
+///   · AppleScript 要申请「自动化」权限，内核没有 Info.plist，权限框弹不出来，直接失败
+/// 绝不 SIGKILL：Antigravity 可能正在弹「确认退出」，强杀会丢掉正在跑的 agent。
+///
+/// 端口用 0：由 Chromium 自己挑一个空闲端口写进 DevToolsActivePort，只监听 127.0.0.1。
+pub fn relaunch_with_debug_port() -> Result<String, String> {
+    let pids = antigravity_pids();
+    // 从正在运行的进程推出 App 路径（可能装在 ~/Applications 或叫 Antigravity Beta）
+    let app = pids
+        .first()
+        .and_then(|&p| crate::sys::pid_exe(p))
+        .and_then(|exe| exe.split("/Contents/MacOS/").next().map(|s| s.to_string()))
+        .or_else(|| {
+            let home = crate::sys::home();
+            [
+                std::path::PathBuf::from("/Applications/Antigravity.app"),
+                home.join("Applications/Antigravity.app"),
+            ]
+            .into_iter()
+            .find(|p| p.exists())
+            .map(|p| p.to_string_lossy().into_owned())
+        })
+        .ok_or_else(|| "没有找到 Antigravity.app".to_string())?;
+
+    if !pids.is_empty() {
+        for &p in &pids {
+            unsafe {
+                libc::kill(p as libc::pid_t, libc::SIGTERM);
+            }
+        }
+        // 正常退出要关窗口、停 language_server，实测十几秒
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while antigravity_running() {
+            if std::time::Instant::now() > deadline {
+                return Err("Antigravity 没有退出（可能在等你确认退出），处理后再点一次".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    }
+
+    // ⚠️ 必须带 -n（强制新实例）。
+    // 实测：进程刚退出的一两秒内，LaunchServices 里还登记着它，
+    // 不带 -n 的 `open -a` 会被当成「激活已有的 App」，--args 被静默丢掉，
+    // 结果 Antigravity 照样重开了、却没有调试端口。
+    // 走到这里时主进程已经确认退出，-n 不会开出第二个实例；
+    // 万一还有残留实例，Electron 的单实例锁会让新进程把参数转交后自己退出，也无害。
+    let mut cmd = std::process::Command::new("/usr/bin/open");
+    cmd.args(["-n", "-a", &app, "--args", "--remote-debugging-port=0"]);
+    match crate::sys::output_timeout(cmd, std::time::Duration::from_secs(15)) {
+        Some(o) if o.status.success() => {}
+        Some(o) => {
+            return Err(format!(
+                "打开 Antigravity 失败: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ))
+        }
+        None => return Err("打开 Antigravity 超时".into()),
+    }
+
+    // 等调试端口出现，好让调用方知道这次是不是真的成了
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if crate::upstream::devtools_ok() {
+            return Ok("已重新打开 Antigravity（调试端口已开启）".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Err("Antigravity 已打开，但 30 秒内没有出现调试端口".into())
 }
 
 /// 判断 Antigravity 的状态。

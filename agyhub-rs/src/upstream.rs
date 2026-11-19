@@ -255,6 +255,137 @@ pub fn find_upstream(force: bool) -> Option<u16> {
     None
 }
 
+/// 调试端口是否真的可用：文件在，且端口上确实有人在监听。
+///
+/// ## 为什么要单独判断
+///
+/// Antigravity 2.33.0 起，只有带 `--remote-debugging-port` 启动时才开调试端口，
+/// 不带的话启动时还会主动删掉 DevToolsActivePort。从程序坞打开、自动更新后重启
+/// 都不带这个参数 → 桌面版注入全部做不了。菜单要能说清楚是这个原因，
+/// 而不是笼统地显示"正在生效…"。
+///
+/// 只看文件不够：Antigravity 崩溃时文件可能残留，端口却早没了。
+pub fn devtools_ok() -> bool {
+    devtools_port().map(crate::sys::tcp_listening).unwrap_or(false)
+}
+
+/// 官方是否已经放开桌面版 SSH 入口。
+///
+/// - `Some(true)`：服务端 `GetMendelFlags` 里 `enable-ssh-remote` 没带 `disabled`
+///   （2.33.0 起官方正式开放 SSH），不需要再注入钩子
+/// - `Some(false)`：仍带 `disabled: true`，需要注入
+/// - `None`：查不到（Antigravity 没开、没登录、接口变了），按老逻辑走
+///
+/// 直接查开关而不是比版本号：官方哪天收回、或者灰度到一部分账号，都能如实反映。
+///
+/// 结果按上游端口缓存 10 分钟（`run/ssh_flag`）：响应约 80KB，
+/// `status` 每 3 秒跑一次，不能每次都拉。端口变了 = Antigravity 重启过，重新查。
+pub fn ssh_official(upstream_port: Option<u16>) -> Option<bool> {
+    let port = upstream_port?;
+    let cache = crate::sys::run_dir().join("ssh_flag");
+    let now = crate::sys::now_secs();
+    if let Ok(s) = std::fs::read_to_string(&cache) {
+        let f: Vec<&str> = s.split_whitespace().collect();
+        if f.len() == 3 {
+            let (p, ts, v) = (f[0].parse::<u16>().ok(), f[1].parse::<u64>().ok(), f[2]);
+            if p == Some(port) && ts.map(|t| now.saturating_sub(t) < 600).unwrap_or(false) {
+                return Some(v == "1");
+            }
+        }
+    }
+    let v = query_ssh_flag(port)?;
+    let _ = std::fs::create_dir_all(crate::sys::run_dir());
+    let _ = std::fs::write(&cache, format!("{} {} {}", port, now, if v { 1 } else { 0 }));
+    Some(v)
+}
+
+/// 真正去问 language_server。走明文 HTTP 端口，和网关用的是同一个。
+fn query_ssh_flag(port: u16) -> Option<bool> {
+    // 1. 首页里拿 csrfToken（接口要求带 x-codeium-csrf-token 头）
+    let index = http_simple(port, "GET", "/", &[], b"", 64 * 1024)?;
+    let key = "\"csrfToken\":\"";
+    let i = index.find(key)? + key.len();
+    let token: String = index[i..].chars().take_while(|c| *c != '"').collect();
+    if token.is_empty() {
+        return None;
+    }
+
+    // 2. 用 Connect 协议的普通 JSON 调用（不是 grpc-web 帧），响应就是一个 JSON 对象
+    let body = http_simple(
+        port,
+        "POST",
+        "/exa.language_server_pb.LanguageServerService/GetMendelFlags",
+        &[
+            ("Content-Type", "application/json"),
+            ("x-codeium-csrf-token", token.as_str()),
+        ],
+        b"{}",
+        2 * 1024 * 1024,
+    )?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let exps = v.pointer("/experimentConfig/experiments")?.as_array()?;
+    for e in exps {
+        if e.get("keyString").and_then(|k| k.as_str()) == Some("enable-ssh-remote") {
+            let disabled = e.get("disabled").and_then(|d| d.as_bool()).unwrap_or(false);
+            return Some(!disabled);
+        }
+    }
+    // 列表里根本没有这一项：前端拿不到 flag，入口不会显示，等同于没放开
+    Some(false)
+}
+
+/// 极简阻塞 HTTP/1.0 请求，返回响应体。
+///
+/// 用 HTTP/1.0：服务器发完就关连接，读到 EOF 即结束，不用解析 chunked / keep-alive。
+/// 不发 Accept-Encoding，响应不会被 gzip。
+fn http_simple(
+    port: u16,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    max_bytes: usize,
+) -> Option<String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let addr = SocketAddrV4::new(UPSTREAM_HOST, port);
+    let mut s = TcpStream::connect_timeout(&addr.into(), PROBE_TIMEOUT).ok()?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
+    let _ = s.set_write_timeout(Some(Duration::from_secs(3)));
+
+    let mut req = format!(
+        "{} {} HTTP/1.0\r\nHost: {}:{}\r\nContent-Length: {}\r\n",
+        method, path, UPSTREAM_HOST, port, body.len()
+    );
+    for (k, v) in headers {
+        req.push_str(&format!("{}: {}\r\n", k, v));
+    }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes()).ok()?;
+    s.write_all(body).ok()?;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if Instant::now() > deadline || buf.len() > max_bytes {
+            return None;
+        }
+        match s.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => return None,
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let (head, rest) = text.split_once("\r\n\r\n")?;
+    if !head.starts_with("HTTP/1.") || !head.split_whitespace().nth(1).map(|c| c == "200").unwrap_or(false) {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
 /// 读 Antigravity 的调试端口（DevToolsActivePort 第一行）。
 pub fn devtools_port() -> Option<u16> {
     let path = crate::sys::home()

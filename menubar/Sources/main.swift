@@ -42,9 +42,11 @@ struct ServiceStatus: Decodable {
     var target = ""
     var lastError = ""
     var detail = ""
+    /// 仅桌面版 SSH 入口：官方已开放，不需要注入
+    var official = false
 
     enum K: String, CodingKey {
-        case enabled, running, starting, port, pid, url, target, detail
+        case enabled, running, starting, port, pid, url, target, detail, official
         case lastError = "last_error"
     }
 
@@ -61,6 +63,7 @@ struct ServiceStatus: Decodable {
         target = c.v(.target, "")
         lastError = c.v(.lastError, "")
         detail = c.v(.detail, "")
+        official = c.v(.official, false)
     }
 }
 
@@ -73,6 +76,8 @@ struct HubStatus: Decodable {
     var caTrusted = false
     var agInstalled = true
     var agRunning = true
+    /// 有开着的桌面版注入功能因为 Antigravity 没开调试端口而做不了
+    var agNeedRelaunch = false
     var fwEnabled = false
     var fwBlocked = false
     var web = ServiceStatus()
@@ -91,12 +96,17 @@ struct HubStatus: Decodable {
     struct Ag: Decodable {
         var installed = true
         var running = true
-        enum K: String, CodingKey { case installed, running }
+        var needRelaunch = false
+        enum K: String, CodingKey {
+            case installed, running
+            case needRelaunch = "need_relaunch"
+        }
         init() {}
         init(from d: Decoder) throws {
             let c = try d.container(keyedBy: K.self)
             installed = c.v(.installed, true)
             running = c.v(.running, true)
+            needRelaunch = c.v(.needRelaunch, false)
         }
     }
 
@@ -125,6 +135,7 @@ struct HubStatus: Decodable {
         let ag = c.v(.antigravity, Ag())
         agInstalled = ag.installed
         agRunning = ag.running
+        agNeedRelaunch = ag.needRelaunch
         let fw = c.v(.firewall, Fw())
         fwEnabled = fw.enabled
         fwBlocked = fw.blocked
@@ -623,7 +634,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func maybeEnsureInject(force: Bool) {
         guard status.zh.enabled || status.ssh.enabled else { return }
         // 用户刚点了开关、那条命令还在跑：别同时再巡检一次（会重复刷新页面）
-        guard status.agRunning, !injecting, busy["ssh"] == nil, busy["zh"] == nil else { return }
+        guard status.agRunning, !injecting, busy["ssh"] == nil, busy["zh"] == nil, busy["relaunch"] == nil else { return }
+        // 没有调试端口时巡检必然失败，原来每 3–6 秒往日志里刷一行同样的错误。
+        // 等用户点「重新打开 Antigravity」，或者自己带参数重开后 need_relaunch 变回 false。
+        guard force || !status.agNeedRelaunch else { return }
         let interval: TimeInterval = (status.zh.running || !status.zh.enabled) && (status.ssh.running || !status.ssh.enabled) ? 6 : 3
         guard force || Date().timeIntervalSince(lastInjectAt) >= interval else { return }
         injecting = true
@@ -760,7 +774,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ssh.toolTip = "让电脑上的 Antigravity 出现「Connect to SSH Host…」。不占端口。"
         menu.addItem(ssh)
         if status.ssh.enabled {
-            let d = status.ssh.running ? "已解锁 · 在 Antigravity 按 ⌘⇧P 搜 ssh" : status.ssh.detail
+            // detail 由内核给：官方已开放 / 已解锁 / 卡住的原因
+            let d: String
+            if status.ssh.running {
+                d = "\(status.ssh.detail.isEmpty ? "已解锁" : status.ssh.detail) · 在 Antigravity 按 ⌘⇧P 搜 ssh"
+            } else {
+                d = status.ssh.detail
+            }
             if !d.isEmpty { menu.addItem(info(d)) }
         }
         let zh = item("中文界面（桌面版）", #selector(toggleZh))
@@ -768,6 +788,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(zh)
         if status.zh.enabled, !status.zh.running, !status.zh.detail.isEmpty {
             menu.addItem(info(status.zh.detail))
+        }
+        // Antigravity 2.33.0 起不带参数启动就没有调试端口，中文注入做不了。
+        // 只给按钮，绝不自动重启：会打断正在跑的 agent。
+        if let b = busy["relaunch"] {
+            menu.addItem(info(b))
+        } else if status.agNeedRelaunch {
+            let r = item("重新打开 Antigravity（开启调试端口）", #selector(relaunchAntigravity), indent: 1)
+            r.toolTip = "从程序坞打开或自动更新后，Antigravity 不开调试端口，桌面版中文用不了。点这里会退出并重新打开它。"
+            menu.addItem(r)
         }
 
         // ---- 设置 ----
@@ -940,7 +969,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func toggleSSH() {
         let on = !status.ssh.enabled
-        if on {
+        // 官方已开放时（2.33.0 起）不注入、不刷新窗口，就不用弹这个提示
+        if on && !status.ssh.official {
             let a = NSAlert()
             a.messageText = "打开桌面版 SSH 入口"
             a.informativeText = "Antigravity 的窗口会刷新一次（不影响正在进行的对话记录），之后在命令面板（⌘⇧P）里搜 ssh 就能看到「Connect to SSH Host…」。"
@@ -955,6 +985,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 dlog("SSH 入口: \(obj?["error"] as? String ?? "")")
             }
             self?.refresh()
+        }
+    }
+
+    @objc func relaunchAntigravity() {
+        let a = NSAlert()
+        a.messageText = "重新打开 Antigravity"
+        a.informativeText = """
+        Antigravity 会先退出再重新打开，正在运行的 agent 会被中断，对话记录不受影响。
+
+        为什么需要：Antigravity 2.33.0 起，只有用特定参数启动才会开调试端口，桌面版中文界面要靠它。从程序坞打开，或者 Antigravity 自动更新后重启，都不会带这个参数，需要在这里再点一次。
+        """
+        a.addButton(withTitle: "重新打开")
+        a.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        perform("relaunch", "正在重新打开 Antigravity…", ["relaunch-antigravity"], timeout: 90) { [weak self] obj in
+            guard let self else { return }
+            if let ok = obj?["ok"] as? Bool, ok {
+                dlog("重新打开 Antigravity: \(obj?["message"] as? String ?? "")")
+                self.flash("已重新打开，几秒后中文生效")
+                self.maybeEnsureInject(force: true)
+            } else {
+                let e = obj?["error"] as? String ?? "内核没有响应"
+                dlog("重新打开 Antigravity 失败: \(e)")
+                self.alert("没能重新打开 Antigravity", e)
+            }
+            self.refresh()
         }
     }
 
