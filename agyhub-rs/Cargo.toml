@@ -1,6 +1,6 @@
 [package]
 name = "agyhub"
-version = "1.2.2"
+version = "1.2.3"
 edition = "2021"
 rust-version = "1.75"
 description = "Antigravity Hub — 把 Antigravity 的网页界面开放给手机和局域网"
