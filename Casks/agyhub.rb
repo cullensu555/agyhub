@@ -8,8 +8,8 @@
 #
 # ⚠ version / sha256 由 menubar/release.sh 在发版时自动改写，不要手改。
 cask "agyhub" do
-  version "1.2.1"
-  sha256 "366450ff9373d1b3cc6f1084445f7245d6fc1391a726fc74fd66c0e2cc98752d"
+  version "1.2.2"
+  sha256 "a0c223336f7f75afa0622147b60f16b49d91d0bd7cdc4a693493613d7ef42269"
 
   url "https://github.com/cullensu555/agyhub/releases/download/v#{version}/AgyHub-#{version}.dmg"
   name "AgyHub"
