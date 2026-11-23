@@ -403,6 +403,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var lastInjectAt = Date.distantPast
     var flashUntil = Date.distantPast
     var timer: Timer?
+    /// 已经就「要不要重开 Antigravity 开调试端口」问过用户了。
+    /// 只问一次：问完不管用户选什么，都不要每 3 秒再弹一遍。
+    /// 不再需要重开（`need_relaunch` 变回 false）时自动复位。
+    var relaunchAsked = false
+    /// App 启动时刻。用来给「弹窗询问」留几秒缓冲，别和首次引导撞车。
+    let launchAt = Date()
 
     let firstRunKey = "AGYHub.onboarded"
 
@@ -653,6 +659,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateIcon()
         guardServices()
         maybeEnsureInject(force: false)
+        // 调试端口没开、又有功能需要它 → 主动问一句，省得用户自己去菜单里找按钮。
+        // 放在 apply 末尾而不是启动时：要给 initialStart 里的启动/巡检先跑完，
+        // 否则可能在 Antigravity 还没起来时就弹。
+        askRelaunchIfNeeded()
     }
 
     /// 只在状态跳变时记日志（每 3 秒记一次的话，有用的信息会被冲掉）。
@@ -857,11 +867,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if status.zh.enabled, !status.zh.running, !status.zh.detail.isEmpty {
             menu.addItem(info(status.zh.detail))
         }
-        // 网页版的上下文/用量指示器：只影响浏览器里那一段脚本，和桌面版无关，
-        // 所以单独一项，不跟中文开关混在一起。
-        let usage = item("显示上下文与用量（网页版）", #selector(toggleUsage))
+        // 上下文/用量指示器：网页版走网关注入，桌面版走 CDP，同一个开关。
+        // 用户想的是「我要看用量」，不该按端拆成两个开关。
+        let usage = item("显示上下文与用量", #selector(toggleUsage))
         usage.state = status.usage.enabled ? .on : .off
-        usage.toolTip = "在网页版发送按钮旁显示上下文占用百分比，点开可看分组明细与本次 token 消耗。"
+        usage.toolTip = "在发送按钮旁显示上下文占用百分比，点开可看分组明细与本次 token 消耗。网页版和桌面版都生效；桌面版需要 Antigravity 开着调试端口。"
         menu.addItem(usage)
         if status.usage.enabled, !status.usage.running, !status.usage.detail.isEmpty {
             menu.addItem(info(status.usage.detail))
@@ -1092,6 +1102,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.alert("没能重新打开 Antigravity", e)
             }
             self.refresh()
+        }
+    }
+
+    /// 发现「需要调试端口但没开」时，主动弹一次窗问用户要不要重开。
+    ///
+    /// ## 为什么不再自己判断"安不安全"
+    ///
+    /// 曾经想按 Antigravity 的启动时长推断"有没有 agent 在跑"，再决定要不要
+    /// 自动重启。那是自找麻烦：判据不可靠（agent 随时可能在跑），代码还难懂。
+    /// 重启会打断什么，用户自己最清楚 —— 所以**问一句**就行，把决定权还回去。
+    ///
+    /// 只问一次：问过之后无论用户选什么，都不再重复弹（否则每 3 秒弹一遍）。
+    /// Antigravity 换过进程（pid 变了，说明它自己重启过）后可以再问。
+    func askRelaunchIfNeeded() {
+        guard status.agNeedRelaunch, status.agRunning else {
+            // 不再需要重开了（用户点过、或者 Antigravity 自己带参数启动了）→ 复位，
+            // 下次再出现同样情况还能问一次
+            relaunchAsked = false
+            return
+        }
+        guard !injecting, busy["relaunch"] == nil, !polling else { return }
+        // 每 3 秒 refresh 一次，同一次「需要重开」只问一遍
+        if relaunchAsked { return }
+        // 刚启动那几秒先别弹：initialStart 里的启服务/巡检还没跑完，
+        // 这时弹窗容易和「已在运行」的首次引导撞在一起。
+        guard Date().timeIntervalSince(launchAt) > 8 else { return }
+        relaunchAsked = true
+
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "需要重新打开一次 Antigravity"
+        a.informativeText = """
+        桌面版的「上下文与用量」和中文界面都要靠调试端口，而 Antigravity 这次启动时没带这个参数（从程序坞打开、或自动更新后重启都会这样）。
+
+        现在重新打开吗？正在跑的 agent 会被中断，对话记录不受影响。
+
+        选「以后再说」也行，菜单里随时能再点。
+        """
+        a.addButton(withTitle: "现在重新打开")
+        a.addButton(withTitle: "以后再说")
+        if a.runModal() == .alertFirstButtonReturn {
+            relaunchAntigravity()
         }
     }
 

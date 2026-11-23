@@ -304,11 +304,16 @@ fn status() {
     let fresh = ag_running && state::inject_fresh(&inj, devtools);
     let ssh_running = cfg.ssh_enabled && (ssh_official || (fresh && inj.ssh && inj.ssh_active));
     let zh_running = cfg.zh_enabled && fresh && inj.zh;
+    // 桌面版用量指示器是否已生效（网页版那半边永远算在 running 里，见 status 组装）
+    let usage_running = cfg.usage_enabled && fresh && inj.usage;
     let ssh_pending = cfg.ssh_enabled && !ssh_official && fresh && inj.ssh && !inj.ssh_active;
-    // 需要注入、但 Antigravity 没开调试端口 → 只能带参数重开一次
+    // 需要注入、但 Antigravity 没开调试端口 → 只能带参数重开一次。
+    // 用量指示器也算在内：桌面版同样靠 CDP 注入。
     let need_relaunch = ag_running
         && !devtools_ok
-        && ((cfg.zh_enabled && !zh_running) || (cfg.ssh_enabled && !ssh_running));
+        && ((cfg.zh_enabled && !zh_running)
+            || (cfg.ssh_enabled && !ssh_running)
+            || (cfg.usage_enabled && !usage_running));
     let inject_detail = |enabled: bool, running: bool, ok_text: &str| -> String {
         if !enabled {
             String::new()
@@ -399,10 +404,18 @@ fn status() {
         // detail 为空串，菜单只显示开关本身。
         "usage": {
             "enabled": cfg.usage_enabled,
-            "running": cfg.usage_enabled && web.running,
+            // 两端都算：网页版靠网关注入（web 在跑就有），桌面版靠 CDP 注入。
+            // 只要有一端能看，就算在跑；两端都在才算完全生效（见 detail）。
+            "running": cfg.usage_enabled && (web.running || usage_running),
             "pid": 0,
-            "detail": if cfg.usage_enabled && !web.running {
-                "网页版没在运行，启动后生效".to_string()
+            "detail": if !cfg.usage_enabled {
+                String::new()
+            } else if !web.running && !usage_running {
+                if ag_running && !devtools_ok {
+                    "网页版没在运行；桌面版需要 Antigravity 开调试端口".to_string()
+                } else {
+                    "网页版没在运行，启动后生效".to_string()
+                }
             } else {
                 String::new()
             },
@@ -858,7 +871,10 @@ fn ensure_inject_cmd(args: &[String]) {
     let _lock = inject_lock();
     let cfg = config::Config::load();
     let want_ssh = ssh_hook_needed(&cfg);
-    if !cfg.zh_enabled && !want_ssh {
+    // 桌面版用量指示器：和网页版共用同一个开关（usage_enabled）。
+    // 用户脑子里的「我要看用量」是一个概念，不该因为端不同而分成两个开关。
+    let want_usage = cfg.usage_enabled;
+    if !cfg.zh_enabled && !want_ssh && !want_usage {
         println!("{}", json!({ "ok": true, "skipped": true }));
         return;
     }
@@ -873,7 +889,7 @@ fn ensure_inject_cmd(args: &[String]) {
     let res = rt.block_on(async {
         tokio::time::timeout(
             Duration::from_secs(40),
-            actions::ensure_injected(cfg.zh_enabled, want_ssh, force),
+            actions::ensure_injected(cfg.zh_enabled, want_ssh, want_usage, force),
         )
         .await
         .unwrap_or_else(|_| Err("巡检超时".into()))
@@ -886,6 +902,7 @@ fn ensure_inject_cmd(args: &[String]) {
                 "pages": r.pages,
                 "zh_ok": r.zh_ok,
                 "ssh_ok": r.ssh_ok,
+                "usage_ok": r.usage_ok,
                 "actions": r.actions,
                 "error": r.errors.join("; "),
             })
@@ -936,7 +953,7 @@ fn cmd_ssh_unlock(args: &[String]) {
     let res = rt.block_on(async {
         tokio::time::timeout(
             Duration::from_secs(40),
-            actions::ensure_injected(cfg.zh_enabled, true, true),
+            actions::ensure_injected(cfg.zh_enabled, true, cfg.usage_enabled, true),
         )
         .await
         .unwrap_or_else(|_| Err("注入超时".into()))
@@ -1024,7 +1041,7 @@ fn toggle_zh(args: &[String]) {
             let res = rt.block_on(async {
                 tokio::time::timeout(
                     Duration::from_secs(40),
-                    actions::ensure_injected(true, ssh_hook_needed(&cfg), false),
+                    actions::ensure_injected(true, ssh_hook_needed(&cfg), cfg.usage_enabled, false),
                 )
                 .await
                 .unwrap_or_else(|_| Err("注入超时".into()))

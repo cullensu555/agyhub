@@ -272,6 +272,9 @@ pub struct InjectState {
     /// SSH 钩子至少在一个页面上真正生效过（入口已经出现）
     #[serde(default)]
     pub ssh_active: bool,
+    /// 用量指示器是否已经装到所有页面
+    #[serde(default)]
+    pub usage: bool,
     #[serde(default)]
     pub error: String,
     /// 每个页面最近一次因为 SSH 解锁而刷新的时间（防止反复刷新）

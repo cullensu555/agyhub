@@ -42,12 +42,74 @@ const PROBE_JS: &str = r#"(function(){
   return {
     zh: !!window.__AGY_ZH__,
     ssh: !!(s && !s.off),
+    usage: !!window.__AGY_USAGE__,
     // 钩子真正改写过 GetMendelFlags 响应的次数。为 0 说明钩子装上了，
     // 但页面还没再请求过开关配置，SSH 入口暂时还不会出现。
     patched: s ? (s.patched || 0) : 0,
     ready: document.readyState
   };
 })()"#;
+
+/// 桌面版注入「上下文与用量」指示器。
+///
+/// ## 为什么现在才做
+///
+/// 早先只在网关注入（手机/网页版），因为那时以为桌面版用不上。
+/// 实际上桌面版同样需要看用量，而它不经过网关，只能走 CDP。
+///
+/// ## 为什么可行（不是硬凑）
+///
+/// 和中文注入是同一套机制，两个关键前提都成立：
+///
+/// 1. **数据通道一样**：桌面版窗口加载的是 `http://127.0.0.1:<port>/`，
+///    URL 不带 `wsTransport` 参数 → 前端 `nKd()` 返回 `"off"` →
+///    走 gRPC-Web fetch，`StreamAgentStateUpdates` 同样是 fetch 请求。
+///    （只有 `?useWebSocket=true` 或 `wsTransport=3` 才切 WebSocket，
+///    桌面版两者都不带，已从 app.asar 里确认它加载的就是裸 URL。）
+///
+/// 2. **DOM 一样**：桌面版和网页版是同一个前端包（同一份 /main.js），
+///    `data-testid="send-button"` 这些锚点在两边都成立 ——
+///    中文注入能工作本身就是证明。
+///
+/// ## 不能直接复用网关注入的那段 <script>
+///
+/// 网关是把 `<script id="agy-pricing">` + `<script id="agy-usage-indicator">`
+/// 两个标签插进 HTML。CDP 里没有 HTML 可插，所以：
+///   · 价格表要先自己塞一个 `<script id="agy-pricing">` 进 DOM，
+///     否则脚本里 `getElementById('agy-pricing')` 拿到 null，金额全算不出来；
+///   · 指示器脚本用 eval 直接执行。
+const USAGE_INSTALL_JS: &str = include_str!("../assets/usage-indicator.js");
+
+/// 价格表（注入到 DOM 里供指示器读取）。
+const PRICING_JSON: &str = include_str!("../assets/pricing.json");
+
+/// 拼出「给桌面版装指示器」的完整 JS 表达式。
+///
+/// 拆成两步而不是一个字符串，是因为价格表要原样放进 `<script>` 的
+/// textContent，拼错一个引号整段就废了。用 serde 序列化成 JS 字面量最稳。
+fn usage_desktop_expr() -> String {
+    // 价格表当字符串常量传入，脚本里自己 createElement 挂上去
+    let pricing_literal = js_json(&Value::String(PRICING_JSON.to_string()));
+    format!(
+        r#"(function(){{
+  // 价格表：网关注入时是 HTML 里现成的 <script id="agy-pricing">，
+  // CDP 注入没有 HTML，得自己造一个。已存在就不重复加。
+  try {{
+    if (!document.getElementById('agy-pricing')) {{
+      var el = document.createElement('script');
+      el.id = 'agy-pricing';
+      el.type = 'application/json';
+      el.textContent = {pricing};
+      (document.head || document.documentElement).appendChild(el);
+    }}
+  }} catch (e) {{}}
+}})();
+{script}"#,
+        pricing = pricing_literal,
+        script = USAGE_INSTALL_JS
+    )
+}
+
 
 // ## 什么时候允许为 SSH 解锁刷新页面
 //
@@ -69,6 +131,8 @@ pub struct Report {
     pub ssh_ok: usize,
     /// 钩子已经生效（改写过响应）的页面数
     pub ssh_active: usize,
+    /// 已装上用量指示器的页面数
+    pub usage_ok: usize,
     pub actions: Vec<String>,
     pub errors: Vec<String>,
 }
@@ -98,6 +162,7 @@ return true;
 pub async fn ensure_injected(
     want_zh: bool,
     want_ssh: bool,
+    want_usage: bool,
     force_ssh_reload: bool,
 ) -> Result<Report, String> {
     let devtools_port = crate::cdp::read_debug_port()?;
@@ -107,7 +172,8 @@ pub async fn ensure_injected(
         st.reloaded.clear();
     }
 
-    let result = ensure_injected_inner(want_zh, want_ssh, force_ssh_reload, &mut st).await;
+    let result =
+        ensure_injected_inner(want_zh, want_ssh, want_usage, force_ssh_reload, &mut st).await;
 
     st.ts = sys::now_secs();
     st.devtools_port = devtools_port;
@@ -117,6 +183,7 @@ pub async fn ensure_injected(
             st.zh = want_zh && r.pages > 0 && r.zh_ok == r.pages;
             st.ssh = want_ssh && r.pages > 0 && r.ssh_ok == r.pages;
             st.ssh_active = want_ssh && r.ssh_active > 0;
+            st.usage = want_usage && r.pages > 0 && r.usage_ok == r.pages;
             st.error = r.errors.join("; ");
         }
         Err(e) => {
@@ -124,6 +191,7 @@ pub async fn ensure_injected(
             st.zh = false;
             st.ssh = false;
             st.ssh_active = false;
+            st.usage = false;
             st.error = e.clone();
         }
     }
@@ -134,6 +202,7 @@ pub async fn ensure_injected(
 async fn ensure_injected_inner(
     want_zh: bool,
     want_ssh: bool,
+    want_usage: bool,
     force_ssh_reload: bool,
     st: &mut state::InjectState,
 ) -> Result<Report, String> {
@@ -148,6 +217,12 @@ async fn ensure_injected_inner(
     }
 
     let zh_src = if want_zh { Some(zh_expr()?) } else { None };
+    // 用量指示器的注入表达式（价格表 + 脚本），只在开关打开时才拼
+    let usage_expr = if want_usage {
+        usage_desktop_expr()
+    } else {
+        String::new()
+    };
 
     for p in &pages {
         let sid = match cdp.attach(&p.id).await {
@@ -224,6 +299,33 @@ async fn ensure_injected_inner(
                         rep.actions.push(format!("已注入中文: {}", truncate(&p.url, 50)));
                     }
                     Err(e) => rep.errors.push(format!("中文注入失败: {}", e)),
+                }
+            }
+        }
+
+        // ---- 上下文与用量指示器（桌面版）----
+        //
+        // 放在最后：前面 SSH 可能刷新过页面，刷新后要重新探。
+        // 这个指示器**不需要刷新页面** —— 它只是包一层 window.fetch，
+        // 装上之后页面下一次发 StreamAgentStateUpdates 就能拿到数据，
+        // 不必打断用户当前的操作。
+        if want_usage {
+            let still_has = cdp
+                .eval(&sid, PROBE_JS)
+                .await
+                .ok()
+                .and_then(|v| v.get("usage").and_then(|b| b.as_bool()))
+                .unwrap_or(false);
+            if still_has {
+                rep.usage_ok += 1;
+            } else {
+                match cdp.eval(&sid, &usage_expr).await {
+                    Ok(_) => {
+                        rep.usage_ok += 1;
+                        rep.actions
+                            .push(format!("已注入用量指示器: {}", truncate(&p.url, 50)));
+                    }
+                    Err(e) => rep.errors.push(format!("用量指示器注入失败: {}", e)),
                 }
             }
         }
