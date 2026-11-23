@@ -300,6 +300,178 @@ N 步下来自然 ≈ N × 平均上下文。实测 5 步：上下文 22,805，�
 
 面板会在这两个数差距大时自动加一句解释。
 
+> **2026-11-23 补充：这个"推算"其实可以换成精确值。** 见下面
+> 「五、`modelUsage` 里有 cacheReadTokens（推翻旧结论）」一节 ——
+> 每步的 `cache_read_tokens` 是官方字段，在本地会话库里就能解出来。
+
+---
+
+## 五、`modelUsage` 里有 cacheReadTokens（推翻旧结论）
+
+> 调研：2026-11-23。修正了本文档此前"`modelUsage` 无任何 cache 字段"的判断。
+
+### 结论
+
+`steps[].metadata.modelUsage` 是 `exa.codeium_common_pb.ModelUsageStats`，**它包含缓存字段**，
+只是之前的解析只取了 input/output/thinking/response 四项，把 cache 两个字段漏掉了。
+
+字段号（从 `agy` 二进制里的 proto tag 精确提取）：
+
+| proto 字段 | JSON 名 | 含义 | 实测 |
+|---|---|---|---|
+| 1 | `message_id` | 每步唯一 ID | `bot-<uuid>` |
+| 2 | `inputTokens` | **本步**真正新喂进去的 token | 见下 |
+| 3 | `outputTokens` | 输出（含 thinking） | — |
+| **4** | `cacheWriteTokens` | **缓存写入** | **恒 0（确实不下发）** |
+| **5** | `cacheReadTokens` | **缓存读取** | **有值，精确** |
+| 9 | `thinkingOutputTokens` | 思考 | — |
+| 10 | `responseOutputTokens` | 回复 | — |
+
+### 怎么确认的（双重验证）
+
+**证据一：用 CLI 的真值交叉校验。** CLI 有一个独立会话，它的
+`--output-format json` 明确报了两轮：
+
+```
+T1: input=13403  cache_read=0
+T2: input=15686  cache_read=11349     (15686 = 13403 + 2283)
+```
+
+去解这个 CLI 会话自己的 `.db`（同一个 proto），`modelUsage` 解出来是：
+
+```
+idx=1  {1:1437, 2:13403, 3:24, 9:18, 10:6}          ← field5 缺省 = 0  ✅ 对上 T1
+idx=4  {1:1437, 2:2283,  3:21, 5:11349, 9:15, 10:6} ← field5=11349     ✅ 对上 T2
+```
+
+字段 2 = 单步 input、字段 5 = 该步缓存读取，完全吻合。**这也解释了会话累计与单步的关系**：
+`json` 报的 `input_tokens` 是 `Σ 单步 input`，不是单步值。
+
+**证据二：数值内部的递推关系。** 取本机一个 110 步的桌面版会话，验证：
+
+```
+cache_read(n) == cache_read(n-1) + input(n-1)   （差 1，边界取舍）
+```
+
+109 次相邻转移里 **57 次严格吻合**，其余 52 次全部是**负数偏移** ——
+负偏移 = 上下文变小了，也就是发生了压缩/截断。对照 `step_type=23`（压缩步）
+的 `field28.f5 = 510212`，正好对应紧随其后那次 `-511298` 的偏移。逻辑闭环。
+
+### 三个会话的实际合计（计费口径）
+
+| 会话 | 步数 | 输入 | 缓存读取 | 输出 | 缓存写入 |
+|---|---|---|---|---|---|
+| 长会话 A | 110 | 1,019,067 | 23,543,584 | 115,953 | 0 |
+| 会话 B | 32 | 467,662 | 6,355,328 | 24,205 | 0 |
+| 会话 C | 7 | 74,545 | 249,965 | 1,638 | 0 |
+
+缓存读取 / 输入 ≈ **23 : 1**。这个比例说明：面板里那个"约"字可以拿掉了 ——
+但要改，得先让网关把 raw metadata 透出来（现在前端只能从 gRPC-Web JSON 里读
+已经序列化的字段，而 protojson 用的是 camelCase `cacheReadTokens`，
+**所以只要前端加一行读 `mu2.cacheReadTokens` 就够，不用动内核**）。
+
+### 落地建议（已实施，2026-11-23）
+
+`usage-indicator.js` 第 198 行附近，把推算换成直接读：
+
+```js
+// 现在（推算，带"约"）
+if (frameCtx > 0) { state.session.cached += (frameCtx - inp); }
+else { state.pending.push(inp); }
+
+// 改成（精确，官方字段）
+var cr = num(mu2.cacheReadTokens);
+if (cr > 0 || !state.pending.length) {
+  state.session.cached += cr;
+} else {
+  // 首轮或字段缺失时才退回推算
+  state.pending.push(inp);
+}
+```
+
+`cacheWriteTokens`（field 4）实测恒 0，**保持现在的「未提供」显示不变**。
+
+### ✅ 实抓验证（2026-11-23，已确认可行）
+
+前面是"推断"，这一段是"实测"。用 CDP 往网页版注入 fetch 探针，在新会话里跑两轮，直接读 `steps[].metadata.modelUsage` 的原始 JSON：
+
+**第一轮（首步，无缓存可读）** —— 字段里**没有** `cacheReadTokens`：
+
+```json
+{ "model": "MODEL_PLACEHOLDER_M467", "inputTokens": "21648", "outputTokens": "27",
+  "thinkingOutputTokens": "25", "responseOutputTokens": "2",
+  "apiProvider": "API_PROVIDER_GOOGLE_VERTEX", "messageId": "bot-<uuid>",
+  "responseHeader": { "sessionID": "..." }, "responseId": "c8kDa5_..." }
+```
+
+**第二轮（缓存命中）** —— 字段里**出现了** `cacheReadTokens`：
+
+```json
+{ "model": "...", "inputTokens": "2160", "outputTokens": "18",
+  "thinkingOutputTokens": "16", "responseOutputTokens": "2",
+  "cacheReadTokens": "19591",            ← 多出来的就是这个
+  "apiProvider": "...", "messageId": "bot-...", ... }
+```
+
+数值关系完全吻合：`2160 + 19591 = 21751` ≈ 上一步的 `21648` + 本轮新增。
+
+**三条确定的事实**：
+
+1. `cacheReadTokens` **确实存在于网页版的流里**，键名是 camelCase
+2. 它是 `omitempty`：**缓存为 0 时字段不出现**，所以必须写 `mu2.cacheReadTokens || 0`，不能假设它总在
+3. `cacheWriteTokens` 在两次抓包里都**没有出现** —— 与"恒 0"的结论一致
+
+> ⚠️ 踩坑记录：`StreamAgentStateUpdates` 走的是 **fetch**（不是 WebSocket），
+> 但连接是**长驻**的（单条 30 秒左右后重连）。所以探针**必须在页面加载前注入**
+> （`Page.addScriptToEvaluateOnNewDocument`），事后补注入只能等下一次重连，
+> 期间拿不到任何数据。另外重载页面会清掉运行时补装的探针。
+>
+> ⚠️ 测试务必**新开一个会话**，不要在工作中的会话里发消息 ——
+> 会污染用户的对话历史。
+
+### 改动与实测结果（AgyHub 1.3.1）
+
+只改了 `usage-indicator.js`，**没有动内核、没有新增进程、没有读会话 db**。
+
+最终采用的判断：
+
+```js
+// 缓存读取：官方字段优先（精确，压缩归零也天然正确）
+// 字段是 omitempty，缓存为 0 时整个键不存在。
+// 判据用 `!= null` 而不是 `> 0`：值真的是 0 时（首步、压缩后）
+// 说明官方明确告诉"这步没有缓存读取"，不能再去推算。
+var cr = mu2.cacheReadTokens;
+if (cr !== undefined && cr !== null) {
+  state.session.cached += num(cr);
+} else if (frameCtx > 0) {
+  // 老版本/异常情况没有该字段 → 保留原推算作兜底
+  if (frameCtx > inp) { state.session.cached += (frameCtx - inp); }
+} else {
+  state.pending.push(inp);
+}
+```
+
+逻辑等价性用实抓数据跑过三组（Node 模拟）：
+
+| 场景 | 旧算法 | 新算法 | 期望 |
+|---|---|---|---|
+| 正常两轮（cr=19591） | 19,591 | 19,591 | 19,591 ✅ 一致 |
+| 压缩（cr 归零） | 534,782 | **539,230** | 539,230 ✅ 旧算法少算 4,448 |
+| 字段缺失（老版本） | 9,000 | 9,000 | 9,000 ✅ 兜底一致 |
+
+浏览器端实测（新开会话，跑两轮）：
+
+```
+面板显示：输入 23,808 / 缓存读取 19,634 / 输出 46 / 2 步
+上下文 21,767 / 上限 512,000
+```
+
+**证明读的是官方字段而非推算**：同一时刻的当帧上下文是 21,767，
+次步 input 是 2,160，按旧推算会得 `21,767 − 2,160 = 19,607`，
+而面板显示 **19,634**（= 官方 `cacheReadTokens`）。两者不同，取的是后者。
+
+覆盖范围：网页版（桌面浏览器 UA）和手机 UA 都验证注入成功（脚本各出现 4 次）。
+
 ### 促销数字的含义（写文案时别搞混，但 UI 上不必解释）
 
 > 本段是给改代码的人看的口径说明。**UI 上不需要展示这些解释**（见上面「文案要极简」）。

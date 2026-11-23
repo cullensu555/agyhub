@@ -159,16 +159,25 @@
     //   · 输入（未命中缓存）= 各步 inputTokens 之和。
     //     实测它就是"本步真正新喂进去的 token"，命中隐式缓存的部分不算。
     //   · 输出 = 各步 outputTokens 之和（= 思考 + 回复）。
-    //   · 缓存读取 = Σ(该步时的上下文总量 − 该步 inputTokens)。
-    //     上下文总量是**逐步快照**，不是最后那一个值 ——
-    //     实测 steps[].metadata 里**没有** contextWindowUsage（只有
-    //     createdAt / modelUsage / executionId 这些），所以只能取
-    //     "这一步到达时最后一帧的 contextWindowUsage"。
+    //   · 缓存读取 = 各步 cacheReadTokens 之和（官方字段，见下）。
     //
-    //     ⚠️ 坑：steps 常常**先于** contextWindowUsage 到达（同一帧里没有 cw）。
-    //     最初遇到没有 cw 就按 frameCtx=0 处理，结果那一步缓存永久算 0
-    //     （实测：输入 21,579 / 上下文 21,689，缓存却显示 0）。
-    //     现在改为把这类步"挂起"，等下一次 cw 到达时再结算。
+    // ## 缓存读取：官方有字段，别再推算（2026-11-23 纠正）
+    //
+    // `modelUsage` 是 `exa.codeium_common_pb.ModelUsageStats`，proto 字段号：
+    //   2=input 3=output 4=cacheWrite 5=cacheRead 9=thinking 10=response。
+    // **field 5 就是缓存读取的精确值**，之前只解析了 2/3/9/10，把 4/5 漏了。
+    //
+    // 实抓验证（网页版流里的 protojson，键名 camelCase）：
+    //   首步 input=21648，字段里**没有** cacheReadTokens（缓存为 0）
+    //   第二轮 input=2160，**有** cacheReadTokens=19591，且 2160+19591≈21648
+    //   → 它是 `omitempty`：**缓存为 0 时键不出现**，必须 `|| 0` 兜住。
+    //
+    // ⚠️ 以前的算法是 Σ(上下文总量 − 该步 inputTokens)，问题是：
+    //   ① 上下文压缩时（实测见过 4 次，缓存读数直接归零）那一步会算出负数，
+    //      被 `frameCtx > inp` 挡掉 → **这一步的缓存量静默丢失，再也补不回来**；
+    //   ② frameCtx 取自"当帧 contextWindowUsage"，而 steps 常常先于 cw 到达，
+    //      挂起队列里的多步会共用**同一个** cw 结算，上下文不一致时集体算错。
+    //   现在优先用官方字段，只有字段缺失（首步/缓存真的是 0）才退回推算。
     var steps = (u.mainTrajectoryUpdate &&
                  u.mainTrajectoryUpdate.stepsUpdate &&
                  u.mainTrajectoryUpdate.stepsUpdate.steps) || [];
@@ -202,8 +211,16 @@
         state.session.response += num(mu2.responseOutputTokens);
         state.session.steps += 1;
 
-        // 同帧就有上下文快照 → 直接结算；否则挂起等下一个 cw
-        if (frameCtx > 0) {
+        // 缓存读取：官方字段优先（精确，压缩归零也天然正确）
+        // 字段是 omitempty，缓存为 0 时整个键不存在 → `|| 0` 兜住。
+        // 判据用 `!= null` 而不是 `> 0`：值真的是 0 时（首步、压缩后）
+        // 说明官方明确告诉"这步没有缓存读取"，不能再去推算，
+        // 否则又会把"上下文 − 输入"当成缓存算进来。
+        var cr = mu2.cacheReadTokens;
+        if (cr !== undefined && cr !== null) {
+          state.session.cached += num(cr);
+        } else if (frameCtx > 0) {
+          // 老版本/异常情况没有该字段 → 保留原推算作兜底
           if (frameCtx > inp) { state.session.cached += (frameCtx - inp); }
         } else {
           state.pending.push(inp);
@@ -713,7 +730,8 @@
       // 「缓存读取」是官方原词（命中缓存后按低价计的输入）
       h += line('缓存读取', ss.cached, cost ? cost.now.cache : null);
       // 缓存写入：只有 Neon/Hydrogen 有，2027-01-12 生效。
-      // ⚠️ 官方不下发写入量（modelUsage 里没有 cacheWrite 字段），
+      // ⚠️ proto 里确实有 `cacheWriteTokens`（field 4），但实测**恒为 0**
+      // （web 流和 CLI 两条通道的抓包都没出现过该键）→ 官方没有真正下发写入量。
       // 绝不能拿 cache 读取量顶替 —— 会显示出两行相同的假数字。只能标「—」。
       if (cost && cost.cacheWriteFrom) {
         h += '<div class="kv"><span class="label">缓存写入</span>' +
