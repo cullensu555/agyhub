@@ -506,22 +506,85 @@ fn zh_snippet() -> String {
     out
 }
 
+/// 生成网页版「上下文与用量」指示器片段。关闭时返回空串。
+///
+/// 开关是 `~/.agyhub/config.json` 的 `usage_enabled`。
+///
+/// ## 为什么在网关注入，而不走 CDP
+///
+/// 桌面版中文靠 CDP，是因为要改的是 **Antigravity 桌面窗口**。
+/// 而这个指示器的使用者是**手机上的网页版** —— 手机连的是网关，
+/// 根本碰不到桌面的调试端口。网关自己转发的 HTML 里塞一段 script，
+/// 最稳、最快，也不用管 2.33.0 的调试端口 opt-in。
+///
+/// ## 为什么每次都重读配置
+///
+/// 和中文不同，这个开关没有「巡检」环节：用户在菜单里一关，
+/// 下次请求首页就该变。所以这里不做静态缓存 —— 脚本 ~14 KB，
+/// 加进一个 58 KB 的首页里，开销可以忽略。
+fn usage_snippet() -> &'static str {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return "",
+    };
+    let cfg_path = format!("{}/.agyhub/config.json", home);
+    let enabled = std::fs::read_to_string(&cfg_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("usage_enabled").and_then(|b| b.as_bool()))
+        // 老配置里没这个字段时按"开"处理，与 Config::default 保持一致
+        .unwrap_or(true);
+    if !enabled {
+        return "";
+    }
+    include_str!("../assets/usage-indicator.js")
+}
+
+/// 把 usage 脚本包成 <script>。脚本里没有 `</script>`，可以直接内联。
+fn usage_tag() -> String {
+    let js = usage_snippet();
+    if js.is_empty() {
+        return String::new();
+    }
+    // 价格表作为全局常量先注入，指示器脚本读它算钱。
+    // 单独一块而不是拼进脚本，是为了以后改价格只动 pricing.json，
+    // 不用碰那 20 KB 的指示器逻辑。
+    let pricing = include_str!("../assets/pricing.json");
+    let mut out = String::with_capacity(js.len() + pricing.len() + 128);
+    out.push_str("\n<script id=\"agy-pricing\" type=\"application/json\">\n");
+    out.push_str(pricing);
+    out.push_str("\n</script>\n");
+    out.push_str("<script id=\"agy-usage-indicator\">\n");
+    out.push_str(js);
+    out.push_str("\n</script>\n");
+    out
+}
+
 /// 对 HTML 做注入。没有 </head> 时退到 <body>，再退到末尾。
-pub fn patch_html(html: &str) -> String {
+///
+/// `upstream` 是当前连着的上游明文 HTTP 端口，用于补齐首页被置空的 csrfToken。
+pub fn patch_html(html: &str, upstream: u16) -> String {
     let base = patch_snippet();
     // 中文注入拼在基础补丁后面；关闭时 zh_snippet() 返回空串，不影响其他功能
     let zh = zh_snippet();
+    // 上下文与用量指示器（独立开关）
+    let usage = usage_tag();
     let patch: String = if zh.is_empty() {
         base.to_string()
     } else {
         format!("{}{}", base, zh)
+    };
+    let patch: String = if usage.is_empty() {
+        patch
+    } else {
+        format!("{}{}", patch, usage)
     };
     let patch = patch.as_str();
     let mut out = String::with_capacity(html.len() + patch.len());
 
     // 标题先在服务端钉一次：先于任何 JS 执行，避免标签页闪一下旧名字。
     let html = set_title(html);
-    let html = fill_remote_csrf(&html);
+    let html = fill_remote_csrf(&html, upstream);
 
     // 注入点必须在 </head> 之前，但匹配要**不区分大小写**：
     // 上游模板用的是小写，将来若改风格不能因此失效。
@@ -545,23 +608,32 @@ pub fn patch_html(html: &str) -> String {
     out
 }
 
-/// SSH 模式：远端首页口令被置空时，把隧道取到的主口令填回去。
+/// 首页口令被置空时，把主口令填回去。
 ///
-/// 2.33.0 起官方 SSH 部署的远端服务开了「UI 一次性令牌」：首页
-/// `__APP_CONFIG__.csrfToken` 为空，只有带 `#t=` 令牌打开才能换到会话口令，
-/// 而令牌只有桌面版主进程能签发。网关打开的页面拿不到任何口令，
-/// 前端抛 "Missing LS CSRF token cookie"，整页白屏。
+/// ## 两种模式都要填（2.34.0 起）
 ///
-/// 填回主口令后，页面行为等同旧版远端服务（口令本来就直接写在首页里）。
+/// · **SSH 模式**：2.33.0 起远端服务开了「UI 一次性令牌」，首页 `csrfToken` 为空，
+///   只有带 `#t=` 令牌打开才能换到会话口令，而令牌只有桌面版主进程能签发。
+///   网关打开的页面拿不到任何令牌 → 前端抛 "Missing LS CSRF token cookie" → 白屏。
+///
+/// · **本机模式**：2.34.0 起同样把首页口令置空（实测本机上游首页也是
+///   `"csrfToken":""`）。表现完全一样：整页白屏。所以这里不能再只认 SSH 模式。
+///
+/// 填回主口令后，页面行为等同旧版服务（口令本来就直接写在首页里）。
 /// 能看到这个页面的人已经过了网关口令，不扩大暴露面。
 /// 前端定期 `fetch(location.href)` 重读口令，也经过这里，所以一直有效。
-/// 本机模式、或远端首页本来就带口令时不改。
-fn fill_remote_csrf(html: &str) -> String {
+/// 读不到口令、或首页本来就带口令时，原样返回（等于旧行为，不会更糟）。
+fn fill_remote_csrf(html: &str, upstream: u16) -> String {
     const EMPTY: &str = "\"csrfToken\":\"\"";
-    if crate::upstream::remote_port().is_none() || !html.contains(EMPTY) {
+    if !html.contains(EMPTY) {
         return html.to_string();
     }
-    let token = crate::upstream::remote_csrf();
+    let token = match crate::upstream::remote_port() {
+        // SSH 模式：口令来自隧道读到的远端 discovery 文件
+        Some(_) => crate::upstream::remote_csrf(),
+        // 本机模式：从 hub_<端口>.json 里读
+        None => crate::upstream::local_csrf(upstream).unwrap_or_default(),
+    };
     if token.is_empty() {
         return html.to_string();
     }

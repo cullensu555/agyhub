@@ -84,9 +84,11 @@ struct HubStatus: Decodable {
     var ssh = ServiceStatus()
     var sshWeb = ServiceStatus()
     var zh = ServiceStatus()
+    /// 网页版「上下文与用量」指示器（开关随配置，没有独立进程）
+    var usage = ServiceStatus()
 
     enum K: String, CodingKey {
-        case version, token, web, ssh, zh, antigravity, firewall
+        case version, token, web, ssh, zh, usage, antigravity, firewall
         case upstreamOk = "upstream_ok"
         case lanIp = "lan_ip"
         case caTrusted = "ca_trusted"
@@ -143,6 +145,69 @@ struct HubStatus: Decodable {
         ssh = c.v(.ssh, ServiceStatus())
         sshWeb = c.v(.sshWeb, ServiceStatus())
         zh = c.v(.zh, ServiceStatus())
+        usage = c.v(.usage, ServiceStatus())
+    }
+}
+
+// MARK: - 价格表
+
+/// Gemini 公开价（每 100 万 token，美元）。
+///
+/// 数据来自内核资源里的 `pricing.json` —— 和网页版面板算钱用的是**同一份文件**，
+/// 所以不会出现「菜单里一个价、面板里另一个价」。
+/// 读不到就返回空数组，菜单里会显示一句提示而不是崩掉。
+struct PricingTable {
+    struct Model {
+        let id: String
+        let label: String
+        let input: Double
+        let output: Double
+        let cache: Double
+        /// 缓存写入（只有 Neon / Hydrogen 有），通常带生效日
+        let cacheWrite: Double?
+        let cacheWriteFrom: String?
+        /// 促销截止日（到期后按 regular 计价）
+        let promoUntil: String?
+        /// 官方原话备注，用来区分「赠金返还」和「真打折」
+        let promoNote: String?
+        let regular: (input: Double, output: Double, cache: Double)?
+
+        /// 是否属于「50% 赠金返还」那种（单价不变、返额度）
+        var isRebate: Bool {
+            (promoNote ?? "").contains("赠金返还")
+        }
+    }
+
+    /// pricing.json 的位置：App 包内 Resources。
+    /// 和内核注入网页版用的是同一个文件，保证两处价格一致。
+    static func load() -> [Model] {
+        guard let url = Bundle.main.url(forResource: "pricing", withExtension: "json"),
+              let data = try? Data(contentsOf: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let list = root["models"] as? [[String: Any]] else {
+            return []
+        }
+        return list.compactMap { m in
+            guard let id = m["id"] as? String,
+                  let label = m["label"] as? String,
+                  let inp = (m["input"] as? NSNumber)?.doubleValue,
+                  let out = (m["output"] as? NSNumber)?.doubleValue else { return nil }
+            let cache = (m["cache"] as? NSNumber)?.doubleValue ?? 0
+            var reg: (Double, Double, Double)?
+            if let r = m["regular"] as? [String: Any],
+               let ri = (r["input"] as? NSNumber)?.doubleValue,
+               let ro = (r["output"] as? NSNumber)?.doubleValue {
+                let rc = (r["cache"] as? NSNumber)?.doubleValue ?? 0
+                reg = (ri, ro, rc)
+            }
+            return Model(id: id, label: label, input: inp, output: out,
+                         cache: cache,
+                         cacheWrite: (m["cacheWrite"] as? NSNumber)?.doubleValue,
+                         cacheWriteFrom: m["cacheWriteFrom"] as? String,
+                         promoUntil: m["promoUntil"] as? String,
+                         promoNote: m["_promoNote"] as? String,
+                         regular: reg)
+        }
     }
 }
 
@@ -306,6 +371,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     var status = HubStatus()
     var updaterController: SPUStandardUpdaterController?
+
+    /// 价格表窗口。持有一份引用，避免点一次留一个野窗口。
+    var pricingWindow: NSWindow?
 
     /// status 轮询（串行，同一时刻只有一个在跑）
     let pollQueue = DispatchQueue(label: "agyhub.poll")
@@ -789,6 +857,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if status.zh.enabled, !status.zh.running, !status.zh.detail.isEmpty {
             menu.addItem(info(status.zh.detail))
         }
+        // 网页版的上下文/用量指示器：只影响浏览器里那一段脚本，和桌面版无关，
+        // 所以单独一项，不跟中文开关混在一起。
+        let usage = item("显示上下文与用量（网页版）", #selector(toggleUsage))
+        usage.state = status.usage.enabled ? .on : .off
+        usage.toolTip = "在网页版发送按钮旁显示上下文占用百分比，点开可看分组明细与本次 token 消耗。"
+        menu.addItem(usage)
+        if status.usage.enabled, !status.usage.running, !status.usage.detail.isEmpty {
+            menu.addItem(info(status.usage.detail))
+        }
+        // 价格表：网页版面板里的金额是按这张表换算的，
+        // 用户点开能自己核对，不用猜。
+        menu.addItem(item("查看 Gemini 价格表…", #selector(showPricing), indent: 1))
         // Antigravity 2.33.0 起不带参数启动就没有调试端口，中文注入做不了。
         // 只给按钮，绝不自动重启：会打断正在跑的 agent。
         if let b = busy["relaunch"] {
@@ -1025,6 +1105,198 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             self?.refresh()
         }
+    }
+
+    /// 网页版用量指示器开关。
+    ///
+    /// 和中文不同，它不需要连 CDP、也不用等 Antigravity ——
+    /// 只是在网关转发的首页里塞/不塞一段脚本，所以超时给短一点，
+    /// 并明确提示「刷新页面生效」（页面已经加载的不会自动变）。
+    @objc func toggleUsage() {
+        let on = !status.usage.enabled
+        status.usage.enabled = on
+        perform("usage", "", ["usage", on ? "on" : "off"], timeout: 15) { [weak self] obj in
+            guard let self else { return }
+            let msg = obj?["message"] as? String ?? obj?["error"] as? String ?? ""
+            dlog("用量指示器 \(on ? "开" : "关"): \(msg)")
+            if let ok = obj?["ok"] as? Bool, ok {
+                self.flash(on ? "已开启，刷新网页后出现" : "已关闭，刷新网页后消失")
+            } else {
+                self.alert("没能切换用量指示器", msg)
+            }
+            self.refresh()
+        }
+    }
+
+    // MARK: 价格表
+
+    /// 展示 Gemini 价格表。
+    ///
+    /// 为什么用自绘窗口而不是 NSAlert：价格表是张表格，
+    /// NSAlert 的 informativeText 只能排纯文本，列对不齐、还看不清折扣。
+    /// 这里用一个可滚动的 NSTextView 渲染等宽文本表格，够用且不引入新依赖。
+    ///
+    /// 数据源是内核自带的那份 `pricing.json`（网页版算钱用的同一张表），
+    /// 所以这里显示的价和面板里算出来的一定一致，不会出现两处对不上。
+    @objc func showPricing() {
+        let rows = PricingTable.load()
+
+        let win = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 520),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered, defer: false)
+        win.title = "Gemini 价格表（按公开 API 价换算）"
+        win.center()
+        // 关闭时释放，避免每点一次留一个窗口对象
+        win.isReleasedWhenClosed = false
+
+        let scroll = NSScrollView(frame: win.contentView!.bounds)
+        scroll.autoresizingMask = [.width, .height]
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.drawsBackground = true
+
+        let tv = NSTextView(frame: scroll.bounds)
+        tv.isEditable = false
+        tv.isSelectable = true
+        tv.drawsBackground = true
+        tv.textContainerInset = NSSize(width: 18, height: 16)
+        // NSTextView 放进 NSScrollView 时要显式打开这几项，
+        // 否则文本区不会跟着视图宽度走、也不会有正确的滚动高度。
+        tv.minSize = NSSize(width: 0, height: 0)
+        tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                            height: CGFloat.greatestFiniteMagnitude)
+        tv.isVerticallyResizable = true
+        tv.isHorizontallyResizable = false
+        tv.autoresizingMask = [.width]
+        tv.textContainer?.widthTracksTextView = true
+        tv.textContainer?.containerSize = NSSize(
+            width: scroll.contentSize.width,
+            height: CGFloat.greatestFiniteMagnitude)
+
+        // 等宽字体 + 富文本，方便做列对齐和折扣高亮
+        let attr = NSMutableAttributedString()
+        let mono = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let monoBold = NSFont.monospacedSystemFont(ofSize: 12.5, weight: .semibold)
+        let para = NSMutableParagraphStyle()
+        para.lineSpacing = 3
+
+        func add(_ s: String, _ f: NSFont, _ color: NSColor? = nil) {
+            var attrs: [NSAttributedString.Key: Any] = [.font: f, .paragraphStyle: para]
+            if let c = color { attrs[.foregroundColor] = c }
+            attr.append(NSAttributedString(string: s, attributes: attrs))
+        }
+
+        // 中文是双宽字符，等宽字体里一个汉字占两个英文字符的位置。
+        // 所以不能用 %-20@（按字符数补），得按**显示宽度**补空格，
+        // 否则中文名列会把后面的价格列顶歪。
+        func pad(_ s: String, _ width: Int) -> String {
+            var w = 0
+            for ch in s.unicodeScalars {
+                // 粗略判定：CJK / 全角标点算 2，其余算 1。
+                // 够用 —— 这张表里只有中文和 ASCII。
+                w += (ch.value >= 0x1100 && (
+                    ch.value <= 0x115F ||
+                    (ch.value >= 0x2E80 && ch.value <= 0xA4CF) ||
+                    (ch.value >= 0xAC00 && ch.value <= 0xD7A3) ||
+                    (ch.value >= 0xF900 && ch.value <= 0xFAFF) ||
+                    (ch.value >= 0xFE30 && ch.value <= 0xFE6F) ||
+                    (ch.value >= 0xFF00 && ch.value <= 0xFF60) ||
+                    (ch.value >= 0xFFE0 && ch.value <= 0xFFE6))) ? 2 : 1
+            }
+            return s + String(repeating: " ", count: max(0, width - w))
+        }
+
+        func row(_ name: String, _ a: String, _ b: String,
+                 _ cw: String, _ c: String) -> String {
+            // 价格列右对齐：等宽字体下按字符补空格就够（都是 ASCII）
+            func rpad(_ s: String, _ w: Int) -> String {
+                return String(repeating: " ", count: max(0, w - s.count)) + s
+            }
+            return pad(name, 24) + rpad(a, 9) + "  " + rpad(b, 10) + "  "
+                 + rpad(cw, 10) + "  " + rpad(c, 9) + "\n"
+        }
+
+        add("每 100 万 token，美元（标准档 / 全球端点；Priority ×1.8，Batch ×0.5）\n\n",
+            monoBold)
+
+        if rows.isEmpty {
+            add("读不到价格表（pricing.json）。\n", mono, .systemRed)
+            add("这个文件应该在 AgyHub.app/Contents/Resources/ 下。\n" +
+                "重新安装一次 App 通常就能恢复。\n", mono, .secondaryLabelColor)
+        } else {
+            add(row("模型", "输入", "缓存读取", "缓存写入", "输出"), monoBold)
+            add(String(repeating: "─", count: 68) + "\n", mono, .separatorColor)
+        }
+
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd"
+        let today = Date()
+
+        func daysLeft(_ until: String) -> (Int, String)? {
+            guard let d = df.date(from: until) else { return nil }
+            if d < Calendar.current.startOfDay(for: today) { return nil }
+            let n = Calendar.current.dateComponents([.day], from: today, to: d).day ?? 0
+            return (n, n == 0 ? "今天最后一天" : "还剩 \(n) 天")
+        }
+
+        for m in rows {
+            add(row(m.label,
+                    String(format: "$%.2f", m.input),
+                    String(format: "$%.3f", m.cache),
+                    m.cacheWrite.map { String(format: "$%.3f", $0) } ?? "—",
+                    String(format: "$%.2f", m.output)), mono)
+
+            // 缓存写入：只有 Neon/Hydrogen 有，且 2027-01-12 才生效
+            if m.cacheWrite != nil, let from = m.cacheWriteFrom,
+               let dl = daysLeft(from) {
+                add("  ↳ 缓存写入 \(from) 起计费（\(dl.1)），目前暂免\n",
+                    mono, .secondaryLabelColor)
+            }
+
+            // 促销行：区分「赠金返还」和「真打折」——性质和应对完全不同
+            if let until = m.promoUntil, let dl = daysLeft(until) {
+                if m.isRebate {
+                    let reg = m.regular
+                    var s = "  ↳ 至 \(until) 享净支出 50% 赠金返还（\(dl.1)）"
+                    if let r = reg {
+                        s += "；之后单价 $" + String(format: "%.2f", r.input)
+                            + " / $" + String(format: "%.3f", r.cache)
+                            + " / $" + String(format: "%.2f", r.output)
+                    }
+                    add(s + "\n", mono, .systemOrange)
+                } else if let r = m.regular {
+                    add("  ↳ 促销价，至 \(until)（\(dl.1)）；之后 $"
+                        + String(format: "%.2f / %.3f / %.2f",
+                                 r.input, r.cache, r.output) + "\n",
+                        mono, .systemOrange)
+                }
+            }
+        }
+
+        add("\n", mono)
+        add("说明\n", monoBold)
+        add("· Antigravity 是订阅制，这里只是「假如按 Gemini API 公开价计费」的参考值，\n"
+            + "  和你实际付的钱不是一回事。\n"
+            + "· 输出单价已包含思考（thinking）token —— 官方就是这样计价的。\n"
+            + "· 缓存只作用于输入：读缓存便宜，输出每字都是新生成的，没有「缓存输出」。\n"
+            + "· 缓存写入目前只有 Neon / Hydrogen 有，且 2027-01-12 才生效。\n"
+            + "  注意：写入量官方不下发，面板里无法统计，只能显示「未提供」。\n"
+            + "· Gemini 3.1 Pro 输入超 20 万 token 时整体按长上下文档计（$4/$0.4/$18）。\n"
+            + "· 网页版面板里的金额用的就是这张表，两边一定一致。\n",
+            mono, .secondaryLabelColor)
+        add("\n来源：https://cloud.google.com/model-garden/pricing?hl=zh_cn\n",
+            mono, .tertiaryLabelColor)
+        add("更新：2026-11-21\n", mono, .tertiaryLabelColor)
+
+        tv.textStorage?.setAttributedString(attr)
+        scroll.documentView = tv
+        win.contentView?.addSubview(scroll)
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        // 让窗口活到用户关掉它为止
+        pricingWindow = win
     }
 
     // MARK: 菜单动作 —— 链接、二维码

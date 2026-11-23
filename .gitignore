@@ -74,3 +74,9 @@ menubar/vendor/
 menubar/release/
 menubar/update/
 menubar/dist/
+
+# ---- 文档截图（不进库）----
+# 界面截图的侧边栏/设置页会带出私人项目名、真实姓名和邮箱，
+# 本仓库是公开的，所以截图只作为本地参考资料，不提交。
+# 文档里改用文字描述，不依赖图片。
+docs/img/

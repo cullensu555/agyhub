@@ -67,6 +67,12 @@ echo "==> 拷贝 Rust 内核"
 cp "$CORE/target/release/agyhub" "$APP/Contents/Resources/agyhub"
 chmod +x "$APP/Contents/Resources/agyhub"
 
+# 价格表跟着内核一起走：
+#   · 内核用 include_str! 把它注入网页版（算钱）
+#   · Swift 外壳从 Resources 读同一份（菜单里展示）
+# 必须是同一个文件，否则两处价格会对不上。
+cp "$CORE/assets/pricing.json" "$APP/Contents/Resources/pricing.json"
+
 echo "==> 拷贝 Sparkle"
 # -R 保留 framework 内部的符号链接结构（Versions/B、Current 等），
 # 用 -L 会把链接展开成实体，framework 就坏了

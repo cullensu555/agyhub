@@ -387,7 +387,7 @@ async fn handle(
     if head.is_html() {
         let raw = up.read_all(mode).await?;
         let text = String::from_utf8_lossy(&raw);
-        let patched = inject::patch_html(&text);
+        let patched = inject::patch_html(&text, port);
         let out = patched.into_bytes();
 
         let mut r = Response::builder().status(StatusCode::from_u16(head.status).unwrap_or(StatusCode::OK));

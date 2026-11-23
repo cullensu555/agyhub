@@ -167,6 +167,13 @@ project-4k                       remove-conversation-history
 show-all-models-in-gemini-app
 ```
 
+> ⚠️ **`enable-context-usage-indicator` 在网页版无效，别再去试**（2026-11-20 实证）。
+> flag 能把功能位打开，但**渲染组件根本没打进网页版**：宿主 `getAppVariant` 里写死
+> `contextUsageIndicator: void 0`，渲染处 `kr?.contextUsageIndicator?.Indicator` 恒为假；
+> Electron 侧 `app.asar` 全量扫描也没有注入。设置页同理不可见（`visible:!1`）。
+> 写了 flag 的唯一效果是往 localStorage 塞一条废数据。
+> 数据本身拿得到，详见 [usage-indicator.md](usage-indicator.md)。
+
 ---
 
 ## B 类：需要 host 命中（15 个）

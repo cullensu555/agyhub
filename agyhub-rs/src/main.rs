@@ -63,7 +63,7 @@ fn main() {
         "run", "status", "doctor", "trust-cert", "rotate-token",
         "set-enabled", "set-port", "pick-port",
         "ssh-hosts", "start-ssh-web", "stop-ssh-web", "start-web", "stop-web", "stop",
-        "zh", "ssh-unlock", "ensure-inject", "relaunch-antigravity", "help", "version",
+        "zh", "ssh-unlock", "ensure-inject", "relaunch-antigravity", "usage", "help", "version",
     ];
     // 带值的开关：值要一起跳过，否则 `--target status` 里的 status 会被当成子命令
     let valued_flags = ["--port", "--target", "--ssh-target", "--wait"];
@@ -121,6 +121,7 @@ fn main() {
         "set-port" => set_port_cmd(&args),
         "ssh-hosts" => list_ssh_hosts(),
         "zh" => toggle_zh(&args),
+        "usage" => toggle_usage(&args),
         "ssh-unlock" => cmd_ssh_unlock(&args),
         "ensure-inject" => ensure_inject_cmd(&args),
         // 只由用户在菜单里点击触发；守护逻辑永远不调它（会打断正在跑的 agent）
@@ -207,6 +208,7 @@ fn usage() {
            agyhub stop                    停止全部后台服务\n  \
            agyhub ssh-hosts               列出 ~/.ssh/config 里的主机\n  \
            agyhub zh on|off               桌面版中文界面\n  \
+           agyhub usage on|off            网页版的上下文与用量指示器\n  \
            agyhub ssh-unlock [off]        桌面版 SSH 入口\n  \
            agyhub relaunch-antigravity    带调试端口重新打开 Antigravity（中文界面需要）\n  \
            agyhub trust-cert [--force]    把根证书装进钥匙串\n  \
@@ -392,6 +394,18 @@ fn status() {
             "running": zh_running,
             "pid": 0,
             "detail": inject_detail(cfg.zh_enabled, zh_running, "已生效"),
+        },
+        // 网页版用量指示器：只是往首页塞一段脚本，在跑即生效，没有"待注入"状态。
+        // detail 为空串，菜单只显示开关本身。
+        "usage": {
+            "enabled": cfg.usage_enabled,
+            "running": cfg.usage_enabled && web.running,
+            "pid": 0,
+            "detail": if cfg.usage_enabled && !web.running {
+                "网页版没在运行，启动后生效".to_string()
+            } else {
+                String::new()
+            },
         },
         "both_on": cfg.web_enabled && cfg.ssh_enabled && cfg.ssh_web_enabled,
         "token_persisted": !cfg.token.is_empty(),
@@ -1037,6 +1051,52 @@ fn toggle_zh(args: &[String]) {
                     })
                 ),
             }
+        }
+    }
+}
+
+/// 网页版「上下文与用量」指示器开关。用法：agyhub usage on|off|status
+///
+/// 和中文不同，这个开关**没有巡检、也不需要连 CDP**：
+/// 它只是在网关转发的首页里塞/不塞一段脚本，所以开关本身就是"立即生效" ——
+/// 用户刷新页面就能看到变化。因此这里不需要等 Antigravity、不需要超时重试。
+fn toggle_usage(args: &[String]) {
+    let mut cfg = config::Config::load();
+    let action = args
+        .iter()
+        .skip(1)
+        .find(|a| *a == "on" || *a == "off" || *a == "status")
+        .cloned()
+        .unwrap_or_else(|| "status".to_string());
+
+    match action.as_str() {
+        "status" => {
+            println!(
+                "{}",
+                json!({ "ok": true, "enabled": cfg.usage_enabled })
+            );
+        }
+        "off" => {
+            cfg.usage_enabled = false;
+            let _ = cfg.save();
+            println!(
+                "{}",
+                json!({
+                    "ok": true, "enabled": false,
+                    "message": "已关闭，刷新网页后消失",
+                })
+            );
+        }
+        _ => {
+            cfg.usage_enabled = true;
+            let _ = cfg.save();
+            println!(
+                "{}",
+                json!({
+                    "ok": true, "enabled": true,
+                    "message": "已开启，刷新网页后出现在发送按钮旁",
+                })
+            );
         }
     }
 }

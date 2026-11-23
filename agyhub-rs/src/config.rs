@@ -47,6 +47,16 @@ pub struct Config {
     /// 是否启用中文语言包
     #[serde(default)]
     pub zh_enabled: bool,
+    /// 网页版是否显示「上下文与用量」指示器。
+    ///
+    /// 官方有对应的功能开关（`enable-context-usage-indicator`），但**网页版根本
+    /// 没打包那个组件** —— 宿主 `getAppVariant` 里写死 `contextUsageIndicator: void 0`，
+    /// 写了 flag 也不会渲染。数据倒是完整推给前端了，所以这里自己画一个。
+    ///
+    /// 缺省 **true**：它只读不写、不改页面行为，默认开着没副作用。
+    /// ⚠️ serde 的 default 必须与 `Default` 一致，否则老配置反序列化会和首次安装不同。
+    #[serde(default = "default_true")]
+    pub usage_enabled: bool,
     /// 配置格式版本（见 `migrate`）。老配置文件里没有这个字段 = 0。
     #[serde(default)]
     pub schema: u32,
@@ -85,6 +95,7 @@ impl Default for Config {
             ssh_web_port: default_ssh_web_port(),
             ssh_target: String::new(),
             zh_enabled: false,
+            usage_enabled: true,
             schema: SCHEMA,
         }
     }

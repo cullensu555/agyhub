@@ -198,6 +198,52 @@ pub fn remote_csrf() -> String {
     REMOTE_CSRF.lock().unwrap().clone()
 }
 
+/// 本机 language_server 的主口令（从 discovery 文件里读）。
+///
+/// ## 为什么需要
+///
+/// Antigravity 2.34.0 起，**本机模式**的首页 `__APP_CONFIG__.csrfToken` 也被置空了
+/// （2.33.0 只在 SSH 部署的远端服务上这么做）。首页拿不到口令时，前端 `Q9()`
+/// 三处回退全部落空 → 抛 `Missing LS CSRF token cookie` → 建不出 gRPC 客户端 → 白屏。
+///
+/// 口令本身还在 discovery 文件里：
+/// `~/.gemini/antigravity/daemon/hub_<httpPort>.json` → `csrfToken`
+/// （文件名就是明文 HTTP 端口，正好等于我们连的上游端口）。
+///
+/// ## 为什么不走 /auth/mint
+///
+/// 桌面版主进程那套一次性令牌要多两步 HTTP（mint → 换 sessionToken），
+/// 而换出来的 sessionToken 实测**就等于这里的 csrfToken**。直接读文件，
+/// 少两次往返、少一个失败点。
+///
+/// 解析不了就返回 None（退回到不改首页，即 2.34.0 之前的行为）。
+pub fn local_csrf(port: u16) -> Option<String> {
+    let path = crate::sys::home()
+        .join(".gemini")
+        .join("antigravity")
+        .join("daemon")
+        .join(format!("hub_{}.json", port));
+    // 这份文件由 Antigravity 写成 0600，读不到就当作没有。
+    let text = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    // 端口要对得上：目录里堆着历次启动的文件，别拿错某一代的口令。
+    if v.get("httpPort").and_then(|p| p.as_u64()) != Some(port as u64) {
+        return None;
+    }
+    let token = v.get("csrfToken").and_then(|t| t.as_str())?;
+    // 口令要原样拼进页面 JS 里，只接受 UUID 那类字符（和 tunnel 里的校验一致）。
+    let safe = !token.is_empty()
+        && token.len() <= 128
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if safe {
+        Some(token.to_string())
+    } else {
+        None
+    }
+}
+
 pub fn find_upstream(force: bool) -> Option<u16> {
     // 远端模式：上游固定，直接返回。
     //

@@ -68,6 +68,7 @@ cask 文件在 `Casks/agyhub.rb`，`release.sh` 发版时会自动更新里面�
 | **SSH 网页版** | 手机访问**开发机**的完整界面 | 配好 `~/.ssh/config` + 密钥免密 |
 | **桌面版 SSH 入口** | 让电脑上的 Antigravity 出现「Connect to SSH Host…」 | Antigravity 2.33.0 起官方已开放，不再注入；更早的版本打开时窗口会刷新一次 |
 | **中文界面（桌面版）** | 电脑上的 Antigravity 显示中文，重启后自动恢复 | 需要 Antigravity 开着调试端口。2.33.0 起，从程序坞打开或自动更新重启后不会开，菜单里会出现「重新打开 Antigravity」，点一下即可 |
+| **显示上下文与用量（网页版）** | 网页版发送按钮旁显示上下文占用百分比，点开看分组明细、本会话 token 与按公开价换算的金额（默认开启） | 无。只影响浏览器里的页面，不改桌面版 |
 
 每个服务下面有：链接（点击在本机打开）、复制链接、显示二维码、端口。
 启动失败时，原因直接显示在菜单里，点击可以看完整说明。
@@ -126,6 +127,7 @@ $A start-ssh-web --target dev    # 后台启动 SSH 网页版（--wait 30 等到
 $A stop                          # 停止全部服务
 $A ssh-hosts                     # 列出 ~/.ssh/config 里的主机（支持 Include）
 $A zh on|off                     # 桌面版中文界面
+$A usage on|off                  # 网页版的上下文与用量指示器
 $A ssh-unlock [off]              # 桌面版 SSH 入口
 $A relaunch-antigravity          # 带调试端口重新打开 Antigravity（中文界面需要）
 $A trust-cert                    # 安装根证书
@@ -305,6 +307,7 @@ menubar/            Swift 外壳
 
 packaging/          Homebrew cask 与安装脚本
 docs/customflags.md 网页版 101 个功能开关的调研清单（含哪些打不开）
+docs/usage-indicator.md 上下文与用量指示器：官方现状、数据来源、实现要点
 ```
 
 ---
